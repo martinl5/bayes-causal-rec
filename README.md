@@ -221,7 +221,3 @@ Phase 3 where per-round refit speed is the binding constraint.
   Identification is not Enough — On the Assumptions of the Deconfounded Recommender.
   *arXiv:1910.11379*.
 
-## Author Note
-
-Built as a portfolio project targeting Bayesian + causal RecSys roles at big-tech
-companies (Google, DeepMind, Grab).
