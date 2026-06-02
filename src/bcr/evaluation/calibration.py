@@ -6,8 +6,8 @@ if predicted probabilities are systematically off, IPW estimates are biased.
 
 from __future__ import annotations
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 def expected_calibration_error(
@@ -37,7 +37,7 @@ def expected_calibration_error(
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
     ece = 0.0
 
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:], strict=False):
         in_bin = (propensities >= lo) & (propensities < hi)
         if not in_bin.any():
             continue
@@ -70,7 +70,7 @@ def plot_calibration_curve(
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
     bin_mids, mean_preds, mean_acts, counts = [], [], [], []
 
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:], strict=False):
         in_bin = (propensities >= lo) & (propensities < hi)
         if not in_bin.any():
             continue
@@ -86,9 +86,16 @@ def plot_calibration_curve(
     # Reliability diagram
     ax = axes[0]
     ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Perfect calibration")
-    ax.scatter(mean_preds, mean_acts, s=np.array(counts) / max(counts) * 200 + 20,
-               color="steelblue", alpha=0.8, zorder=3, label="Bin means")
-    for mp, ma, cnt in zip(mean_preds, mean_acts, counts):
+    ax.scatter(
+        mean_preds,
+        mean_acts,
+        s=np.array(counts) / max(counts) * 200 + 20,
+        color="steelblue",
+        alpha=0.8,
+        zorder=3,
+        label="Bin means",
+    )
+    for mp, ma in zip(mean_preds, mean_acts, strict=False):
         ax.vlines(mp, min(mp, ma), max(mp, ma), color="tomato", linewidth=1.5, alpha=0.7)
     ax.set_xlabel("Mean predicted probability")
     ax.set_ylabel("Fraction of positives (actual)")

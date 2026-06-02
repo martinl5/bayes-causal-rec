@@ -7,8 +7,6 @@ and DoublyRobust evaluation.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import arviz as az
 import numpy as np
 import pymc as pm
@@ -36,10 +34,10 @@ class BayesianPropensityModel:
 
     def __init__(self, random_seed: int = 42) -> None:
         self.random_seed = random_seed
-        self.model: Optional[pm.Model] = None
-        self.trace: Optional[az.InferenceData] = None
-        self._n_users: Optional[int] = None
-        self._n_items: Optional[int] = None
+        self.model: pm.Model | None = None
+        self.trace: az.InferenceData | None = None
+        self._n_users: int | None = None
+        self._n_items: int | None = None
 
     def build_model(self, train_mask: np.ndarray) -> pm.Model:
         """Build the propensity model on the binary observation mask.
@@ -138,6 +136,6 @@ class BayesianPropensityModel:
         if self.trace is None:
             raise RuntimeError("Model not yet fitted.")
         alpha_mean = self.trace.posterior["alpha"].values.mean(axis=(0, 1))  # (n_users,)
-        beta_mean = self.trace.posterior["beta"].values.mean(axis=(0, 1))    # (n_items,)
+        beta_mean = self.trace.posterior["beta"].values.mean(axis=(0, 1))  # (n_items,)
         logit_p = alpha_mean[:, None] + beta_mean[None, :]
         return scipy.special.expit(logit_p).astype(np.float32)

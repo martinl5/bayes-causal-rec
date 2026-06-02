@@ -6,15 +6,12 @@ Phase 3 extension: NumPyroPMF with SVI (added in Phase 3).
 
 from __future__ import annotations
 
-import warnings
-from typing import Optional
-
 import arviz as az
 import jax
 import jax.numpy as jnp
+import numpy as np
 import numpyro
 import numpyro.distributions as dist
-import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
 from numpyro.infer import SVI, Trace_ELBO
@@ -45,12 +42,12 @@ class BayesianPMF:
     def __init__(self, n_factors: int = 10, random_seed: int = 42) -> None:
         self.n_factors = n_factors
         self.random_seed = random_seed
-        self.model: Optional[pm.Model] = None
-        self.trace: Optional[az.InferenceData] = None
-        self._n_users: Optional[int] = None
-        self._n_items: Optional[int] = None
-        self._user_idx_obs: Optional[np.ndarray] = None
-        self._item_idx_obs: Optional[np.ndarray] = None
+        self.model: pm.Model | None = None
+        self.trace: az.InferenceData | None = None
+        self._n_users: int | None = None
+        self._n_items: int | None = None
+        self._user_idx_obs: np.ndarray | None = None
+        self._item_idx_obs: np.ndarray | None = None
 
     def build_model(
         self,
@@ -69,6 +66,7 @@ class BayesianPMF:
         n_users, n_items = ratings.shape
         user_idx, item_idx = np.where(mask)
         ratings_obs = ratings[user_idx, item_idx].astype(float)
+        global_mean = float(ratings_obs.mean()) if ratings_obs.size else 0.0
 
         self._n_users = n_users
         self._n_items = n_items
@@ -81,19 +79,32 @@ class BayesianPMF:
             sigma_v = pm.HalfNormal("sigma_v", sigma=1.0)
             tau = pm.HalfNormal("tau", sigma=1.0)
 
+            # Global mean + user/item bias intercepts.  Without these, the
+            # zero-mean factor priors force predictions toward 0 while ratings
+            # live in [1, 5], producing RMSE ~= the mean rating.  The biases
+            # anchor predictions to the rating scale (standard PMF practice).
+            mu_global = pm.Normal("mu_global", mu=global_mean, sigma=1.0)
+            sigma_bu = pm.HalfNormal("sigma_bu", sigma=1.0)
+            sigma_bi = pm.HalfNormal("sigma_bi", sigma=1.0)
+            bias_u_offset = pm.Normal("bias_u_offset", mu=0.0, sigma=1.0, shape=n_users)
+            bias_i_offset = pm.Normal("bias_i_offset", mu=0.0, sigma=1.0, shape=n_items)
+            bias_u = pm.Deterministic("bias_u", bias_u_offset * sigma_bu)
+            bias_i = pm.Deterministic("bias_i", bias_i_offset * sigma_bi)
+
             # Non-centred latent factors
-            U_offset = pm.Normal(
-                "U_offset", mu=0.0, sigma=1.0, shape=(n_users, self.n_factors)
-            )
-            V_offset = pm.Normal(
-                "V_offset", mu=0.0, sigma=1.0, shape=(n_items, self.n_factors)
-            )
+            U_offset = pm.Normal("U_offset", mu=0.0, sigma=1.0, shape=(n_users, self.n_factors))
+            V_offset = pm.Normal("V_offset", mu=0.0, sigma=1.0, shape=(n_items, self.n_factors))
 
             U = pm.Deterministic("U", U_offset * sigma_u)
             V = pm.Deterministic("V", V_offset * sigma_v)
 
             # Predicted ratings for observed entries
-            r_hat = pt.sum(U[user_idx] * V[item_idx], axis=1)
+            r_hat = (
+                mu_global
+                + bias_u[user_idx]
+                + bias_i[item_idx]
+                + pt.sum(U[user_idx] * V[item_idx], axis=1)
+            )
 
             # Likelihood via pm.Data so the array is mutable post-build
             ratings_data = pm.Data("ratings_obs", ratings_obs)
@@ -150,12 +161,25 @@ class BayesianPMF:
     # ------------------------------------------------------------------
 
     def _score_matrix(self) -> np.ndarray:
-        """Return (n_users × n_items) posterior-mean score matrix."""
+        """Return (n_users × n_items) posterior-mean score matrix.
+
+        Includes the global mean and user/item bias intercepts so that scores
+        are on the rating scale, not just the zero-centred factor interaction.
+        """
         if self.trace is None:
             raise RuntimeError("Model not yet fitted.")
-        U_mean = self.trace.posterior["U"].values.mean(axis=(0, 1))  # (n_users, K)
-        V_mean = self.trace.posterior["V"].values.mean(axis=(0, 1))  # (n_items, K)
-        return U_mean @ V_mean.T  # (n_users, n_items)
+        post = self.trace.posterior
+        U_mean = post["U"].values.mean(axis=(0, 1))  # (n_users, K)
+        V_mean = post["V"].values.mean(axis=(0, 1))  # (n_items, K)
+        scores = U_mean @ V_mean.T  # (n_users, n_items)
+
+        # Add intercepts if present (models trained before bias terms omit them)
+        if "mu_global" in post:
+            mu_global = float(post["mu_global"].values.mean())
+            bias_u = post["bias_u"].values.mean(axis=(0, 1))  # (n_users,)
+            bias_i = post["bias_i"].values.mean(axis=(0, 1))  # (n_items,)
+            scores = scores + mu_global + bias_u[:, None] + bias_i[None, :]
+        return scores
 
     def predict(self, user_idx: int, item_idx: int) -> dict:
         """Posterior predictive statistics for a single (user, item) pair.
@@ -170,14 +194,24 @@ class BayesianPMF:
         if self.trace is None:
             raise RuntimeError("Model not yet fitted.")
 
+        post = self.trace.posterior
         # Gather posterior samples: shape (chains, draws, n_factors)
-        U_s = self.trace.posterior["U"].values[:, :, user_idx, :]
-        V_s = self.trace.posterior["V"].values[:, :, item_idx, :]
+        U_s = post["U"].values[:, :, user_idx, :]
+        V_s = post["V"].values[:, :, item_idx, :]
 
         # Flatten to (n_samples, n_factors) and compute dot-product
         U_flat = U_s.reshape(-1, self.n_factors)
         V_flat = V_s.reshape(-1, self.n_factors)
         r_samples = (U_flat * V_flat).sum(axis=1)
+
+        # Add intercepts per posterior sample (preserves uncertainty)
+        if "mu_global" in post:
+            r_samples = (
+                r_samples
+                + post["mu_global"].values.reshape(-1)
+                + post["bias_u"].values[:, :, user_idx].reshape(-1)
+                + post["bias_i"].values[:, :, item_idx].reshape(-1)
+            )
 
         hdi = az.hdi(r_samples, hdi_prob=0.94)
         return {
@@ -197,15 +231,22 @@ class BayesianPMF:
         """
         if self.trace is None:
             raise RuntimeError("Model not yet fitted.")
+        post = self.trace.posterior
         # U posterior samples: (chains*draws, K)
-        U_s = self.trace.posterior["U"].values[:, :, user_idx, :].reshape(
-            -1, self.n_factors
-        )
+        U_s = post["U"].values[:, :, user_idx, :].reshape(-1, self.n_factors)
         # V posterior samples: (chains*draws, n_items, K)
-        V_s = self.trace.posterior["V"].values.reshape(-1, self._n_items, self.n_factors)
+        V_s = post["V"].values.reshape(-1, self._n_items, self.n_factors)
 
         # r_samples: (n_samples, n_items)
         r_samples = np.einsum("sk,sik->si", U_s, V_s)
+
+        # Add intercepts per posterior sample (preserves uncertainty)
+        if "mu_global" in post:
+            mu_s = post["mu_global"].values.reshape(-1, 1)  # (S, 1)
+            bu_s = post["bias_u"].values[:, :, user_idx].reshape(-1, 1)  # (S, 1)
+            bi_s = post["bias_i"].values.reshape(-1, self._n_items)  # (S, n_items)
+            r_samples = r_samples + mu_s + bu_s + bi_s
+
         return r_samples.mean(axis=0), r_samples.std(axis=0)
 
     def recommend_topk(self, user_idx: int, k: int = 10) -> list[int]:
@@ -264,10 +305,15 @@ class IPSBayesianPMF(BayesianPMF):
         n_users, n_items = ratings.shape
         user_idx, item_idx = np.where(mask)
         ratings_obs = ratings[user_idx, item_idx].astype(float)
+        global_mean = float(ratings_obs.mean()) if ratings_obs.size else 0.0
 
-        # IPS weights for observed entries
+        # IPS weights for observed entries, clipped to control variance, then
+        # self-normalised to mean 1 (SNIPS-style).  Normalisation keeps the
+        # effective observation precision on the same scale as the naive model,
+        # so IPS reweights *relative* importance without inflating overall noise.
         prop_obs = np.clip(propensities[user_idx, item_idx], 1e-6, 1.0)
-        ips_weights = np.clip(1.0 / prop_obs, 1.0, clip_max).astype(float)
+        ips_weights = np.clip(1.0 / prop_obs, 1.0, clip_max)
+        ips_weights = (ips_weights / ips_weights.mean()).astype(float)
 
         self._n_users = n_users
         self._n_items = n_items
@@ -279,17 +325,27 @@ class IPSBayesianPMF(BayesianPMF):
             sigma_v = pm.HalfNormal("sigma_v", sigma=1.0)
             tau = pm.HalfNormal("tau", sigma=1.0)
 
-            U_offset = pm.Normal(
-                "U_offset", mu=0.0, sigma=1.0, shape=(n_users, self.n_factors)
-            )
-            V_offset = pm.Normal(
-                "V_offset", mu=0.0, sigma=1.0, shape=(n_items, self.n_factors)
-            )
+            # Global mean + user/item bias intercepts (see BayesianPMF)
+            mu_global = pm.Normal("mu_global", mu=global_mean, sigma=1.0)
+            sigma_bu = pm.HalfNormal("sigma_bu", sigma=1.0)
+            sigma_bi = pm.HalfNormal("sigma_bi", sigma=1.0)
+            bias_u_offset = pm.Normal("bias_u_offset", mu=0.0, sigma=1.0, shape=n_users)
+            bias_i_offset = pm.Normal("bias_i_offset", mu=0.0, sigma=1.0, shape=n_items)
+            bias_u = pm.Deterministic("bias_u", bias_u_offset * sigma_bu)
+            bias_i = pm.Deterministic("bias_i", bias_i_offset * sigma_bi)
+
+            U_offset = pm.Normal("U_offset", mu=0.0, sigma=1.0, shape=(n_users, self.n_factors))
+            V_offset = pm.Normal("V_offset", mu=0.0, sigma=1.0, shape=(n_items, self.n_factors))
 
             U = pm.Deterministic("U", U_offset * sigma_u)
             V = pm.Deterministic("V", V_offset * sigma_v)
 
-            r_hat = pt.sum(U[user_idx] * V[item_idx], axis=1)
+            r_hat = (
+                mu_global
+                + bias_u[user_idx]
+                + bias_i[item_idx]
+                + pt.sum(U[user_idx] * V[item_idx], axis=1)
+            )
 
             # IPS-scaled sigma: lower propensity → higher weight → tighter noise
             ips_w = pm.Data("ips_weights", ips_weights)
@@ -337,8 +393,8 @@ class NumPyroPMF:
         self.n_steps = n_steps
         self.learning_rate = learning_rate
 
-        self._n_users: Optional[int] = None
-        self._n_items: Optional[int] = None
+        self._n_users: int | None = None
+        self._n_items: int | None = None
         self._svi_result = None
         self._guide = None
         self._model_fn = None
@@ -355,20 +411,29 @@ class NumPyroPMF:
         n_users: int,
         n_items: int,
         n_factors: int,
+        global_mean: float = 0.0,
     ) -> None:
-        """NumPyro generative model for Bayesian PMF."""
+        """NumPyro generative model for Bayesian PMF with bias intercepts."""
         sigma_u = numpyro.sample("sigma_u", dist.HalfNormal(1.0))
         sigma_v = numpyro.sample("sigma_v", dist.HalfNormal(1.0))
         tau = numpyro.sample("tau", dist.HalfNormal(1.0))
 
-        U = numpyro.sample(
-            "U", dist.Normal(jnp.zeros((n_users, n_factors)), sigma_u)
-        )
-        V = numpyro.sample(
-            "V", dist.Normal(jnp.zeros((n_items, n_factors)), sigma_v)
-        )
+        # Global mean + user/item bias intercepts (anchor to rating scale)
+        mu_global = numpyro.sample("mu_global", dist.Normal(global_mean, 1.0))
+        sigma_bu = numpyro.sample("sigma_bu", dist.HalfNormal(1.0))
+        sigma_bi = numpyro.sample("sigma_bi", dist.HalfNormal(1.0))
+        bias_u = numpyro.sample("bias_u", dist.Normal(jnp.zeros(n_users), sigma_bu))
+        bias_i = numpyro.sample("bias_i", dist.Normal(jnp.zeros(n_items), sigma_bi))
 
-        r_hat = jnp.sum(U[user_idx] * V[item_idx], axis=-1)
+        U = numpyro.sample("U", dist.Normal(jnp.zeros((n_users, n_factors)), sigma_u))
+        V = numpyro.sample("V", dist.Normal(jnp.zeros((n_items, n_factors)), sigma_v))
+
+        r_hat = (
+            mu_global
+            + bias_u[user_idx]
+            + bias_i[item_idx]
+            + jnp.sum(U[user_idx] * V[item_idx], axis=-1)
+        )
         numpyro.sample(
             "obs",
             dist.Normal(r_hat, 1.0 / (tau + 1e-6)),
@@ -392,6 +457,7 @@ class NumPyroPMF:
 
         user_idx, item_idx = np.where(mask)
         ratings_obs = ratings[user_idx, item_idx].astype(np.float32)
+        global_mean = float(ratings_obs.mean()) if ratings_obs.size else 0.0
 
         user_idx_jnp = jnp.array(user_idx)
         item_idx_jnp = jnp.array(item_idx)
@@ -399,8 +465,13 @@ class NumPyroPMF:
 
         def model():
             return NumPyroPMF._pmf_model(
-                user_idx_jnp, item_idx_jnp, ratings_jnp,
-                n_users, n_items, self.n_factors,
+                user_idx_jnp,
+                item_idx_jnp,
+                ratings_jnp,
+                n_users,
+                n_items,
+                self.n_factors,
+                global_mean,
             )
 
         guide = AutoNormal(model)
@@ -420,9 +491,7 @@ class NumPyroPMF:
     # Prediction helpers
     # ------------------------------------------------------------------
 
-    def _posterior_samples(
-        self, n_samples: int = 50, rng_key: Optional[jax.Array] = None
-    ) -> dict:
+    def _posterior_samples(self, n_samples: int = 50, rng_key: jax.Array | None = None) -> dict:
         """Draw samples from the variational posterior.
 
         Args:
@@ -444,10 +513,16 @@ class NumPyroPMF:
         return {
             "U": np.array(samples["U"]),  # (n_samples, n_users, K)
             "V": np.array(samples["V"]),  # (n_samples, n_items, K)
+            "mu_global": np.array(samples["mu_global"]),  # (n_samples,)
+            "bias_u": np.array(samples["bias_u"]),  # (n_samples, n_users)
+            "bias_i": np.array(samples["bias_i"]),  # (n_samples, n_items)
         }
 
     def _score_matrix(self, n_samples: int = 50) -> np.ndarray:
         """(n_users × n_items) score matrix averaged over posterior samples.
+
+        Includes the global mean and bias intercepts so scores are on the
+        rating scale.
 
         Args:
             n_samples: Number of variational posterior samples to average.
@@ -458,7 +533,10 @@ class NumPyroPMF:
         samples = self._posterior_samples(n_samples)
         U_mean = samples["U"].mean(axis=0)  # (n_users, K)
         V_mean = samples["V"].mean(axis=0)  # (n_items, K)
-        return U_mean @ V_mean.T
+        mu = float(samples["mu_global"].mean())
+        bu = samples["bias_u"].mean(axis=0)  # (n_users,)
+        bi = samples["bias_i"].mean(axis=0)  # (n_items,)
+        return U_mean @ V_mean.T + mu + bu[:, None] + bi[None, :]
 
     def recommend_greedy(self, user_idx: int, k: int = 10) -> list[int]:
         """Top-k items by posterior-mean score (exploitation baseline).
@@ -477,7 +555,7 @@ class NumPyroPMF:
         self,
         user_idx: int,
         k: int = 10,
-        rng_key: Optional[jax.Array] = None,
+        rng_key: jax.Array | None = None,
     ) -> list[int]:
         """Thompson Sampling: draw one posterior sample, score all items.
 
@@ -494,6 +572,9 @@ class NumPyroPMF:
 
         samples = self._posterior_samples(n_samples=1, rng_key=rng_key)
         U_sample = samples["U"][0, user_idx, :]  # (K,)
-        V_sample = samples["V"][0]               # (n_items, K)
-        scores = V_sample @ U_sample
+        V_sample = samples["V"][0]  # (n_items, K)
+        # bias_i affects within-user ranking; mu_global and bias_u are constant
+        # shifts for a fixed user and do not change the argsort.
+        bias_i = samples["bias_i"][0]  # (n_items,)
+        scores = V_sample @ U_sample + bias_i
         return list(np.argsort(scores)[::-1][:k])

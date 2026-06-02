@@ -1,7 +1,7 @@
 """Data loading and synthetic data generation.
 
 Usage:
-    from scripts.preprocess import load_coat, make_synthetic_mnar
+    from bcr.data.preprocess import load_coat, make_synthetic_mnar
 """
 
 from __future__ import annotations
@@ -34,8 +34,7 @@ def load_coat(data_dir: str = "data/raw") -> dict:
 
     if not train_path.exists() or not test_path.exists():
         raise FileNotFoundError(
-            f"Coat files not found in {coat_dir}. "
-            "Run `python scripts/download_data.py` first."
+            f"Coat files not found in {coat_dir}. Run `python scripts/download_data.py` first."
         )
 
     train = np.loadtxt(train_path, dtype=np.float32)
@@ -101,9 +100,8 @@ def make_synthetic_mnar(
     item_pop = item_pop / item_pop.max()
 
     # MNAR exposure logits
-    log_odds = (
-        alpha_popularity * np.log(item_pop + 1e-6)[np.newaxis, :]
-        + alpha_relevance * (true_ratings - true_ratings.mean())
+    log_odds = alpha_popularity * np.log(item_pop + 1e-6)[np.newaxis, :] + alpha_relevance * (
+        true_ratings - true_ratings.mean()
     )
     propensities = 1.0 / (1.0 + np.exp(-log_odds))
     propensities = np.clip(propensities, min_obs_prob, 1.0)

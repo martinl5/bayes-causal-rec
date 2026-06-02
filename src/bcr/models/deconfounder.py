@@ -25,8 +25,6 @@ IMPORTANT CAVEAT (Ogburn et al., 2020):
 
 from __future__ import annotations
 
-from typing import Optional
-
 import arviz as az
 import numpy as np
 import pymc as pm
@@ -52,11 +50,11 @@ class DeconfoundedRecommender:
         self.n_z_factors = n_z_factors
         self.random_seed = random_seed
 
-        self._Z: Optional[np.ndarray] = None          # (n_users, n_z_factors)
-        self.outcome_model: Optional[pm.Model] = None
-        self.outcome_trace: Optional[az.InferenceData] = None
-        self._n_users: Optional[int] = None
-        self._n_items: Optional[int] = None
+        self._Z: np.ndarray | None = None  # (n_users, n_z_factors)
+        self.outcome_model: pm.Model | None = None
+        self.outcome_trace: az.InferenceData | None = None
+        self._n_users: int | None = None
+        self._n_items: int | None = None
 
     # ------------------------------------------------------------------
     # Stage 1 — Substitute confounder via exposure factor model
@@ -75,7 +73,7 @@ class DeconfoundedRecommender:
         Returns:
             Z array of shape (n_users, n_z_factors), the substitute confounders.
         """
-        from scripts.models.bayesian_pmf import BayesianPMF
+        from bcr.models.bayesian_pmf import BayesianPMF
 
         n_users, n_items = observation_mask.shape
         self._n_users = n_users
@@ -90,8 +88,10 @@ class DeconfoundedRecommender:
         factor_model = BayesianPMF(n_factors=self.n_z_factors, random_seed=self.random_seed)
         factor_model.build_model(mask_ratings, all_mask)
 
-        print(f"[Deconfounder Stage 1] Fitting exposure factor model "
-              f"({n_users} users × {n_items} items, K={self.n_z_factors}) …")
+        print(
+            f"[Deconfounder Stage 1] Fitting exposure factor model "
+            f"({n_users} users × {n_items} items, K={self.n_z_factors}) …"
+        )
         factor_trace = factor_model.fit(draws=300, tune=300, chains=2, target_accept=0.9)
 
         # Z = posterior mean user factors from the exposure model
@@ -137,6 +137,7 @@ class DeconfoundedRecommender:
         n_z = Z.shape[1]
         user_idx, item_idx = np.where(mask)
         ratings_obs = ratings[user_idx, item_idx].astype(float)
+        global_mean = float(ratings_obs.mean()) if ratings_obs.size else 0.0
 
         # Z values for observed entries
         Z_obs = Z[user_idx]  # (n_obs, n_z_factors)
@@ -146,30 +147,35 @@ class DeconfoundedRecommender:
             sigma_v = pm.HalfNormal("sigma_v", sigma=1.0)
             tau = pm.HalfNormal("tau", sigma=1.0)
 
+            # Global mean + user/item bias intercepts (anchor to rating scale)
+            mu_global = pm.Normal("mu_global", mu=global_mean, sigma=1.0)
+            sigma_bu = pm.HalfNormal("sigma_bu", sigma=1.0)
+            sigma_bi = pm.HalfNormal("sigma_bi", sigma=1.0)
+            bias_u_offset = pm.Normal("bias_u_offset", mu=0.0, sigma=1.0, shape=n_users)
+            bias_i_offset = pm.Normal("bias_i_offset", mu=0.0, sigma=1.0, shape=n_items)
+            bias_u = pm.Deterministic("bias_u", bias_u_offset * sigma_bu)
+            bias_i = pm.Deterministic("bias_i", bias_i_offset * sigma_bi)
+
             # Preference factors (non-centred)
-            U_offset = pm.Normal(
-                "U_offset", mu=0.0, sigma=1.0, shape=(n_users, self.n_factors)
-            )
-            V_offset = pm.Normal(
-                "V_offset", mu=0.0, sigma=1.0, shape=(n_items, self.n_factors)
-            )
+            U_offset = pm.Normal("U_offset", mu=0.0, sigma=1.0, shape=(n_users, self.n_factors))
+            V_offset = pm.Normal("V_offset", mu=0.0, sigma=1.0, shape=(n_items, self.n_factors))
             U = pm.Deterministic("U", U_offset * sigma_u)
             V = pm.Deterministic("V", V_offset * sigma_v)
 
             # Confounder coefficient — one scalar per Z dimension
             gamma = pm.Normal("gamma", mu=0.0, sigma=1.0, shape=n_z)
 
-            # Predicted ratings: preference term + confounder adjustment
+            # Predicted ratings: intercepts + preference term + confounder adjustment
             pref_term = pt.sum(U[user_idx] * V[item_idx], axis=1)
             conf_term = pt.dot(pm.Data("Z_obs", Z_obs), gamma)
-            r_hat = pref_term + conf_term
+            r_hat = mu_global + bias_u[user_idx] + bias_i[item_idx] + pref_term + conf_term
 
             ratings_data = pm.Data("ratings_obs", ratings_obs)
             pm.Normal("obs", mu=r_hat, sigma=1.0 / (tau + 1e-6), observed=ratings_data)
 
         self.outcome_model = model
 
-        print(f"[Deconfounder Stage 2] Fitting outcome model conditioned on Z …")
+        print("[Deconfounder Stage 2] Fitting outcome model conditioned on Z …")
         with model:
             self.outcome_trace = pm.sample(
                 draws=500,
@@ -187,9 +193,7 @@ class DeconfoundedRecommender:
         )
         for param in summary.index:
             if summary.loc[param, "r_hat"] >= 1.05:
-                print(
-                    f"⚠️  Convergence warning: R-hat ≥ 1.05 for {param}."
-                )
+                print(f"⚠️  Convergence warning: R-hat ≥ 1.05 for {param}.")
 
         return self.outcome_trace
 
@@ -225,25 +229,32 @@ class DeconfoundedRecommender:
         n_items_req = len(item_indices)
         item_indices = np.asarray(item_indices)
 
+        post = self.outcome_trace.posterior
         # Posterior samples: (chains, draws, ...)
-        U_s = self.outcome_trace.posterior["U"].values[:, :, user_idx, :]  # (C, D, K)
-        V_s = self.outcome_trace.posterior["V"].values[:, :, item_indices, :]  # (C, D, n, K)
-        gamma_s = self.outcome_trace.posterior["gamma"].values  # (C, D, n_z)
+        U_s = post["U"].values[:, :, user_idx, :]  # (C, D, K)
+        V_s = post["V"].values[:, :, item_indices, :]  # (C, D, n, K)
+        gamma_s = post["gamma"].values  # (C, D, n_z)
 
         # Flatten chain/draw dimensions
         n_s = U_s.shape[0] * U_s.shape[1]
-        U_flat = U_s.reshape(n_s, -1)                   # (S, K)
-        V_flat = V_s.reshape(n_s, n_items_req, -1)       # (S, n, K)
-        gamma_flat = gamma_s.reshape(n_s, -1)            # (S, n_z)
+        U_flat = U_s.reshape(n_s, -1)  # (S, K)
+        V_flat = V_s.reshape(n_s, n_items_req, -1)  # (S, n, K)
+        gamma_flat = gamma_s.reshape(n_s, -1)  # (S, n_z)
 
         # Preference term: U[u] · V[i] for each sample and item
         pref = np.einsum("sk,snk->sn", U_flat, V_flat)  # (S, n)
 
         # Confounder term: Z[u] · gamma (same for all items)
-        Z_u = self._Z[user_idx]                          # (n_z,)
-        conf = np.einsum("sz,z->s", gamma_flat, Z_u)    # (S,)
+        Z_u = self._Z[user_idx]  # (n_z,)
+        conf = np.einsum("sz,z->s", gamma_flat, Z_u)  # (S,)
 
-        r_samples = pref + conf[:, None]                 # (S, n)
+        r_samples = pref + conf[:, None]  # (S, n)
+
+        # Add global mean + bias intercepts so relevance is on the rating scale
+        mu_s = post["mu_global"].values.reshape(n_s, 1)  # (S, 1)
+        bu_s = post["bias_u"].values[:, :, user_idx].reshape(n_s, 1)  # (S, 1)
+        bi_s = post["bias_i"].values[:, :, item_indices].reshape(n_s, n_items_req)
+        r_samples = r_samples + mu_s + bu_s + bi_s
 
         means = r_samples.mean(axis=0)
         stds = r_samples.std(axis=0)
@@ -254,13 +265,20 @@ class DeconfoundedRecommender:
         """Return posterior-mean (n_users × n_items) score matrix (deconfounded)."""
         if self.outcome_trace is None or self._Z is None:
             raise RuntimeError("Model not fitted.")
-        U_mean = self.outcome_trace.posterior["U"].values.mean(axis=(0, 1))   # (n_u, K)
-        V_mean = self.outcome_trace.posterior["V"].values.mean(axis=(0, 1))   # (n_i, K)
-        gamma_mean = self.outcome_trace.posterior["gamma"].values.mean(axis=(0, 1))  # (n_z,)
+        post = self.outcome_trace.posterior
+        U_mean = post["U"].values.mean(axis=(0, 1))  # (n_u, K)
+        V_mean = post["V"].values.mean(axis=(0, 1))  # (n_i, K)
+        gamma_mean = post["gamma"].values.mean(axis=(0, 1))  # (n_z,)
 
-        pref_scores = U_mean @ V_mean.T            # (n_u, n_i)
-        conf_adj = self._Z @ gamma_mean            # (n_u,)
-        return pref_scores + conf_adj[:, None]
+        pref_scores = U_mean @ V_mean.T  # (n_u, n_i)
+        conf_adj = self._Z @ gamma_mean  # (n_u,)
+        scores = pref_scores + conf_adj[:, None]
+
+        # Add global mean + bias intercepts so scores sit on the rating scale
+        mu_global = float(post["mu_global"].values.mean())
+        bias_u = post["bias_u"].values.mean(axis=(0, 1))  # (n_u,)
+        bias_i = post["bias_i"].values.mean(axis=(0, 1))  # (n_i,)
+        return scores + mu_global + bias_u[:, None] + bias_i[None, :]
 
     def recommend_topk(self, user_idx: int, k: int = 10) -> list[int]:
         """Return top-k items by deconfounded posterior mean score.

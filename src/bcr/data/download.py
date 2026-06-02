@@ -1,12 +1,12 @@
 """Download datasets for bayes-causal-rec.
 
-Run directly:  python scripts/download_data.py --data-dir data/raw
+Run directly:  python -m bcr.data.download --data-dir data/raw
+Or via the installed entry point:  bcr-download --data-dir data/raw
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 import requests
@@ -52,9 +52,10 @@ def download_coat(data_dir: str = "data/raw") -> None:
                 response = requests.get(url, timeout=30, stream=True, headers=headers)
                 response.raise_for_status()
                 total = int(response.headers.get("content-length", 0))
-                with open(dest, "wb") as f, tqdm(
-                    total=total, unit="B", unit_scale=True, desc=fname
-                ) as bar:
+                with (
+                    open(dest, "wb") as f,
+                    tqdm(total=total, unit="B", unit_scale=True, desc=fname) as bar,
+                ):
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
                         bar.update(len(chunk))
@@ -82,7 +83,8 @@ def coat_is_available(data_dir: str = "data/raw") -> bool:
     return all((coat_dir / f).exists() for f in COAT_FILES)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """CLI entry point: download the Coat dataset, or fall back to synthetic."""
     parser = argparse.ArgumentParser(description="Download datasets.")
     parser.add_argument("--data-dir", default="data/raw", help="Raw data directory")
     args = parser.parse_args()
@@ -92,4 +94,8 @@ if __name__ == "__main__":
         print("\n✓ Coat dataset ready.")
     except RuntimeError as e:
         print(f"\n⚠️  {e}")
-        print("Falling back to synthetic MNAR data (see scripts/preprocess.py).")
+        print("Falling back to synthetic MNAR data (see bcr.data.preprocess).")
+
+
+if __name__ == "__main__":
+    main()

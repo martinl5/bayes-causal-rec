@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from scripts.models.bayesian_pmf import BayesianPMF
+from bcr.models.bayesian_pmf import BayesianPMF
 
 _RELEVANCE_THRESHOLD = 3.0  # ratings >= this count as "relevant" for Recall
 
@@ -81,13 +81,10 @@ def recall_at_k(
     """
     scores = model._score_matrix()
     n_users = test_ratings.shape[0]
-    n_items = test_ratings.shape[1]
     recalls: list[float] = []
 
     for u in range(n_users):
-        relevant = set(
-            np.where(test_mask[u] & (test_ratings[u] >= threshold))[0].tolist()
-        )
+        relevant = set(np.where(test_mask[u] & (test_ratings[u] >= threshold))[0].tolist())
         if not relevant:
             continue
 
@@ -126,18 +123,29 @@ def doubly_robust_ndcg(
     test_ratings: np.ndarray,
     test_mask: np.ndarray,
     k: int = 10,
+    clip_max: float = 10.0,
 ) -> float:
-    """Doubly-Robust NDCG estimator on the unbiased test set.
+    """Doubly-robust NDCG of the policy induced by the direct model.
 
-    Combines direct-model imputation (DM) and IPS correction.  The estimate
-    is unbiased if either the propensity model OR the rating model is correct
-    (Dudík et al., 2011; Saito & Joachims, 2020).
+    Estimates the NDCG that the *direct model's ranking* achieves, using
+    doubly-robust relevance labels.  Crucially, the ranking and the gain come
+    from different quantities:
 
-    DR relevance for user u, item i:
-        dr[u, i] = dm_pred[u, i]
-                   + O_{ui} * (r_{ui} - dm_pred[u, i]) / p_{ui}
+      - **Ranking** is fixed by the direct model (the deployed policy): items
+        are ordered by ``direct_model_predictions[u]``.
+      - **Gain** uses the DR-corrected relevance
+            dr[u, i] = dm_pred[u, i]
+                       + O_{ui} * (r_{ui} - dm_pred[u, i]) * clip(1 / p_{ui})
+        which is unbiased if either the propensity model OR the rating model is
+        correct (Dudík et al., 2011; Saito & Joachims, 2020).
 
-    Items are ranked by dr[u, :] and NDCG computed with max(dr, 0) relevance.
+    The earlier version ranked *and* scored by ``dr`` itself, which trivially
+    self-ranks to 1.0 — corrected here so the number is informative.
+
+    Caveat: with very small propensities the IPS residual has high variance;
+    the inverse propensity is clipped (``clip_max``).  A fully trustworthy
+    DR-NDCG needs a real randomised test split (e.g. Coat) or cross-fitting
+    of the direct model.
 
     Args:
         direct_model_predictions: (n_users, n_items) predicted ratings for ALL items.
@@ -145,6 +153,7 @@ def doubly_robust_ndcg(
         test_ratings: (n_users, n_items) unbiased ratings; 0 = unobserved.
         test_mask: (n_users, n_items) bool; True = observed in test set.
         k: Cutoff rank.
+        clip_max: Maximum inverse-propensity weight (variance control).
 
     Returns:
         Mean DR-NDCG@k across users with at least one test observation.
@@ -157,19 +166,18 @@ def doubly_robust_ndcg(
         if len(test_items) == 0:
             continue
 
-        # Start with direct-model imputation for all items
+        # DR-corrected relevance labels (start from direct-model imputation)
         dr_rel = direct_model_predictions[u].copy()
-
-        # Add IPS residual for observed test items
         for i in test_items:
-            p_ui = max(float(propensities[u, i]), 1e-6)
-            dr_rel[i] += (test_ratings[u, i] - direct_model_predictions[u, i]) / p_ui
-
-        # Rank by DR relevance; clip negatives to 0 for NDCG
+            inv_p = min(1.0 / max(float(propensities[u, i]), 1e-6), clip_max)
+            dr_rel[i] += (test_ratings[u, i] - direct_model_predictions[u, i]) * inv_p
         rel_clipped = np.maximum(dr_rel, 0.0)
-        ranked = np.argsort(dr_rel)[::-1][:k]
+
+        # Rank by the DIRECT MODEL (the deployed policy), not by dr_rel
+        ranked = np.argsort(direct_model_predictions[u])[::-1][:k]
         dcg = sum(rel_clipped[ranked[i]] / np.log2(i + 2) for i in range(len(ranked)))
 
+        # Ideal ranking uses the (DR-corrected) relevance labels
         ideal = np.argsort(rel_clipped)[::-1][:k]
         idcg = sum(rel_clipped[ideal[i]] / np.log2(i + 2) for i in range(len(ideal)))
 
