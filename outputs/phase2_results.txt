@@ -1,37 +1,8 @@
-Phase 2 Results — Synthetic MNAR (50 users × 200 items, 500 draws × 2 chains)
-Generated: 2026-06-02
+Phase 2 Results — Synthetic MNAR (50 users x 200 items, 500 draws x 2 chains)
+Model comparison on unbiased test set:
+  Naive PMF    : NDCG@10=0.6867  Recall@10=0.0445  RMSE=1.1818
+  IPS-PMF      : NDCG@10=0.6875  Recall@10=0.0359  RMSE=1.1823
+  Deconfounded : NDCG@10=0.6868  Recall@10=0.0361  RMSE=1.1837
+  DR-NDCG (eval): 0.3801
 
-Model comparison on unbiased test set (NDCG@10):
-  Naive PMF    : NDCG@10=0.6920  Recall@10=0.0409  RMSE=2.9675
-  IPS-PMF      : NDCG@10=0.6955  Recall@10=0.0431  RMSE=3.0505
-  DR-NDCG(eval): NDCG@10=1.0000  [see note]
-  Deconfounded : NDCG@10=0.7200  Recall@10=0.0456  RMSE=1.2610
-
-Propensity calibration ECE: 0.0058 (excellent)
-
-Counterfactual relevance user 0 (mean ± std):
-  item 0: 3.407 ± 0.958
-  item 1: 3.575 ± 0.285
-  item 2: 4.007 ± 0.297
-  item 3: 3.490 ± 0.294
-  item 4: 3.997 ± 1.322
-
-Timing (CPU):
-  Propensity model  : ~98s
-  Naive PMF         : ~489s
-  IPS-PMF           : ~507s
-  Deconfounded Stg1 : ~637s
-  Deconfounded Stg2 : ~281s
-
-Convergence notes:
-  - IPS-PMF tau: R-hat >= 1.05 (low ESS); max tree depth hit
-    Fix: increase target_accept to 0.95, add max_treedepth=12
-  - All PMF models: low ESS for tau; non-centered parameterisation already applied
-  - Propensity model: 0 divergences — well-behaved
-
-Note on DR-NDCG=1.0000:
-  With synthetic data where the propensity model is near-perfectly calibrated
-  (ECE=0.0058) and the direct-model predictions are strong, the DR correction
-  amplifies already-correct rankings to near-ideal. This is an artefact of
-  small-sample synthetic evaluation. On real biased data (Coat/Yahoo R3),
-  DR-NDCG provides a more meaningful unbiased estimate.
+Propensity calibration ECE: 0.0055

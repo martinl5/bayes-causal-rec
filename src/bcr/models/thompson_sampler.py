@@ -8,13 +8,12 @@ popularity-bias amplification produced by greedy point-estimate recommenders.
 from __future__ import annotations
 
 import time
-from typing import Literal, Optional
+from typing import Literal
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
-from scripts.models.bayesian_pmf import BayesianPMF, NumPyroPMF
+from bcr.models.bayesian_pmf import BayesianPMF, NumPyroPMF
 
 
 class BayesianThompsonSampler:
@@ -56,8 +55,11 @@ class BayesianThompsonSampler:
         d = int(self._rng.integers(n_draws))
 
         U_sample = trace.posterior["U"].values[c, d, user_idx, :]  # (K,)
-        V_sample = trace.posterior["V"].values[c, d]               # (n_items, K)
+        V_sample = trace.posterior["V"].values[c, d]  # (n_items, K)
         scores = V_sample @ U_sample
+        # bias_i shifts within-user item ranking (mu_global, bias_u are constant)
+        if "bias_i" in trace.posterior:
+            scores = scores + trace.posterior["bias_i"].values[c, d]
         return list(np.argsort(scores)[::-1][:k])
 
     def recommend_greedy(self, user_idx: int, k: int = 10) -> list[int]:
@@ -74,6 +76,7 @@ class BayesianThompsonSampler:
 
 
 # ── Feedback-loop simulation ─────────────────────────────────────────────────
+
 
 class FeedbackLoopSimulator:
     """Simulates a sequential recommendation feedback loop over T rounds.
@@ -152,9 +155,7 @@ class FeedbackLoopSimulator:
         train_mask = initial_train_mask.copy()
 
         cumulative_counts = np.zeros(n_items)
-        results: dict[str, list] = {
-            "ndcg": [], "coverage": [], "gini": [], "fit_times": []
-        }
+        results: dict[str, list] = {"ndcg": [], "coverage": [], "gini": [], "fit_times": []}
 
         print(f"\n── Strategy: {strategy.upper()} ──")
 
@@ -190,8 +191,10 @@ class FeedbackLoopSimulator:
                 samples = svi._posterior_samples(n_samples=n_users, rng_key=subkey)
                 U_s = samples["U"]  # (n_users, n_users_dim, K) — sample i for user i
                 V_s = samples["V"]  # (n_users, n_items, K)
+                bias_i_s = samples["bias_i"]  # (n_users, n_items)
                 for u in range(n_users):
-                    scores = V_s[u] @ U_s[u, u, :]  # user u's sample for themselves
+                    # user u's own posterior sample; bias_i shifts item ranking
+                    scores = V_s[u] @ U_s[u, u, :] + bias_i_s[u]
                     recs = list(np.argsort(scores)[::-1][:k])
                     all_recs[u] = recs
                     for i in recs:
@@ -224,7 +227,7 @@ class FeedbackLoopSimulator:
             results["fit_times"].append(fit_time)
 
             print(
-                f"  Round {t+1:2d}/{self.n_rounds}: "
+                f"  Round {t + 1:2d}/{self.n_rounds}: "
                 f"NDCG={ndcg:.4f}  Coverage={coverage:.3f}  "
                 f"Gini={gini:.3f}  SVI={fit_time:.0f}s"
             )
@@ -233,6 +236,7 @@ class FeedbackLoopSimulator:
 
 
 # ── Shared metric helpers ────────────────────────────────────────────────────
+
 
 def _ndcg_from_scores(
     scores: np.ndarray,
@@ -268,6 +272,4 @@ def _gini(counts: np.ndarray) -> float:
     if total == 0.0:
         return 0.0
     sorted_c = np.sort(counts)
-    return float(
-        (2.0 * np.dot(np.arange(1, n + 1), sorted_c)) / (n * total) - (n + 1.0) / n
-    )
+    return float((2.0 * np.dot(np.arange(1, n + 1), sorted_c)) / (n * total) - (n + 1.0) / n)
