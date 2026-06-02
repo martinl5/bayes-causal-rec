@@ -214,3 +214,83 @@ class BayesianPMF:
         """
         scores = self._score_matrix()[user_idx]
         return list(np.argsort(scores)[::-1][:k])
+
+
+class IPSBayesianPMF(BayesianPMF):
+    """BayesianPMF extended with Inverse Propensity Score (IPS) weighting.
+
+    The IPS-corrected likelihood down-weights frequently-observed (high-propensity)
+    items so the model learns preference estimates closer to the unbiased
+    population.
+
+    Modification: the observation noise precision for entry (u, i) is scaled
+    by the IPS weight w_{ui} = clip(1 / P(O_{ui}=1), 1, clip_max).  Items
+    exposed with low probability contribute higher effective precision —
+    i.e., the model trusts those rare signals more, correcting for the
+    selection mechanism.
+
+    Formally:
+        R_{ui} ~ Normal(U[u]·V[i], 1/sqrt(w_{ui} * tau))
+
+    Args:
+        n_factors: Latent factor dimension.
+        random_seed: Seed for NUTS sampling.
+    """
+
+    def build_model(  # type: ignore[override]
+        self,
+        ratings: np.ndarray,
+        mask: np.ndarray,
+        propensities: np.ndarray,
+        clip_max: float = 5.0,
+    ) -> pm.Model:
+        """Build IPS-weighted PyMC model.
+
+        Args:
+            ratings: Dense (n_users, n_items) matrix; 0 where unobserved.
+            mask: Boolean (n_users, n_items); True where observed.
+            propensities: (n_users, n_items) P(observed) from BayesianPropensityModel.
+            clip_max: Maximum IPS weight (variance-reduction clipping).
+
+        Returns:
+            Compiled pm.Model stored in self.model.
+        """
+        n_users, n_items = ratings.shape
+        user_idx, item_idx = np.where(mask)
+        ratings_obs = ratings[user_idx, item_idx].astype(float)
+
+        # IPS weights for observed entries
+        prop_obs = np.clip(propensities[user_idx, item_idx], 1e-6, 1.0)
+        ips_weights = np.clip(1.0 / prop_obs, 1.0, clip_max).astype(float)
+
+        self._n_users = n_users
+        self._n_items = n_items
+        self._user_idx_obs = user_idx
+        self._item_idx_obs = item_idx
+
+        with pm.Model() as model:
+            sigma_u = pm.HalfNormal("sigma_u", sigma=1.0)
+            sigma_v = pm.HalfNormal("sigma_v", sigma=1.0)
+            tau = pm.HalfNormal("tau", sigma=1.0)
+
+            U_offset = pm.Normal(
+                "U_offset", mu=0.0, sigma=1.0, shape=(n_users, self.n_factors)
+            )
+            V_offset = pm.Normal(
+                "V_offset", mu=0.0, sigma=1.0, shape=(n_items, self.n_factors)
+            )
+
+            U = pm.Deterministic("U", U_offset * sigma_u)
+            V = pm.Deterministic("V", V_offset * sigma_v)
+
+            r_hat = pt.sum(U[user_idx] * V[item_idx], axis=1)
+
+            # IPS-scaled sigma: lower propensity → higher weight → tighter noise
+            ips_w = pm.Data("ips_weights", ips_weights)
+            effective_sigma = 1.0 / (pt.sqrt(ips_w * tau) + 1e-6)
+
+            ratings_data = pm.Data("ratings_obs", ratings_obs)
+            pm.Normal("obs", mu=r_hat, sigma=effective_sigma, observed=ratings_data)
+
+        self.model = model
+        return model

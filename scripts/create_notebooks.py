@@ -524,9 +524,358 @@ have fully mixed. Common fixes:
     return nb
 
 
+
+# ======================================================================
+# 02_causal_debiasing.ipynb
+# ======================================================================
+
+def make_02() -> nbf.NotebookNode:
+    nb = nbf.v4.new_notebook()
+    nb.cells = [
+
+        code("""\
+import sys, pathlib, warnings
+sys.path.insert(0, str(pathlib.Path().resolve()))
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+import pymc as pm
+import arviz as az
+
+from scripts.download_data import download_coat
+from scripts.preprocess import load_coat, make_synthetic_mnar
+from scripts.models.bayesian_pmf import BayesianPMF, IPSBayesianPMF
+from scripts.models.propensity import BayesianPropensityModel
+from scripts.models.deconfounder import DeconfoundedRecommender
+from scripts.evaluation.metrics import ndcg_at_k, recall_at_k, rmse_on_test, doubly_robust_ndcg
+from scripts.evaluation.calibration import expected_calibration_error, plot_calibration_curve
+import os
+
+RANDOM_SEED = 42
+os.makedirs("outputs/figures", exist_ok=True)
+os.makedirs("outputs/traces", exist_ok=True)
+sns.set_theme(style="whitegrid", palette="muted")
+"""),
+
+        md("""\
+## Notebook 02 — Causal Debiasing with PyMC
+
+### The MNAR Problem: Why Observed Ratings Are Not a Random Sample
+
+When users choose what to rate, the resulting data is **Missing Not At Random (MNAR)**.
+Popular items receive more ratings, and users tend to rate items they already like.
+A naive recommender trained on this biased sample will:
+
+- **Over-recommend popular items** — the model sees them more and gets more confident
+- **Ignore long-tail items** — sparse ratings → high uncertainty → model avoids them
+- **Report inflated accuracy** — measured on biased training data, not true preferences
+
+### The Causal DAG
+
+```
+     Popularity ─────────────────────────────┐
+          │                                  │
+          ▼                                  ▼
+     User ─────► Exposure (O_{ui}) ─────► Rating (R_{ui})
+          └─────────────────────────────────►
+                    (direct preference)
+```
+
+`Exposure` is a collider: conditioning on it (i.e., only observing rated items)
+opens a spurious path between `Popularity` and `Rating`.  To recover the true
+causal effect of the item on the user's satisfaction, we must account for
+the exposure mechanism.
+
+### Three Strategies Implemented
+
+1. **IPS-PMF**: Inverse Propensity Score weighting — reweight observations by
+   1/P(exposed), down-weighting popular items in the likelihood.
+2. **DR-NDCG**: Doubly-Robust evaluation — combines IPS correction with a
+   direct-model imputation term.  Unbiased if either model is correct.
+3. **Deconfounded Recommender** (Wang et al. 2018): Extract a substitute
+   confounder Z from the exposure pattern; condition the rating model on Z
+   to block the backdoor confounding path.
+"""),
+
+        code("""\
+# ── Draw the causal DAG ──────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.set_xlim(0, 10); ax.set_ylim(0, 6); ax.axis("off")
+
+nodes = {
+    "Popularity": (2, 5),
+    "User\\nfeatures": (2, 2),
+    "Exposure\\n(O_{ui})": (5, 3.5),
+    "Rating\\n(R_{ui})": (8, 3.5),
+    "Confounder\\n(Z)": (5, 1),
+}
+for label, (x, y) in nodes.items():
+    ax.add_patch(plt.Circle((x, y), 0.7, color="steelblue", alpha=0.8, zorder=3))
+    ax.text(x, y, label, ha="center", va="center", fontsize=8, color="white",
+            fontweight="bold", zorder=4)
+
+edges = [
+    ("Popularity", "Exposure\\n(O_{ui})", "black"),
+    ("Popularity", "Rating\\n(R_{ui})", "gray"),
+    ("User\\nfeatures", "Exposure\\n(O_{ui})", "black"),
+    ("User\\nfeatures", "Rating\\n(R_{ui})", "black"),
+    ("Exposure\\n(O_{ui})", "Rating\\n(R_{ui})", "black"),
+    ("Confounder\\n(Z)", "Exposure\\n(O_{ui})", "tomato"),
+    ("Confounder\\n(Z)", "Rating\\n(R_{ui})", "tomato"),
+]
+for src, dst, color in edges:
+    x1, y1 = nodes[src]; x2, y2 = nodes[dst]
+    dx, dy = x2 - x1, y2 - y1
+    length = (dx**2 + dy**2)**0.5
+    ax.annotate("", xy=(x2 - 0.75*dx/length, y2 - 0.75*dy/length),
+                xytext=(x1 + 0.75*dx/length, y1 + 0.75*dy/length),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.8))
+
+ax.text(5, 5.5, "Causal DAG — MNAR Recommendation", ha="center", fontsize=12, fontweight="bold")
+ax.text(5, 0.3, "Red arrows = unmeasured confounder paths that Z approximates",
+        ha="center", fontsize=8, color="tomato")
+plt.tight_layout()
+plt.savefig("outputs/figures/02_causal_dag.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        md("### 1 — Load data"),
+
+        code("""\
+USE_COAT = False
+try:
+    download_coat("data/raw")
+    coat = load_coat("data/raw")
+    full_train_r    = coat["train"]
+    full_test_r     = coat["test"]
+    full_train_mask = coat["train_mask"]
+    full_test_mask  = coat["test_mask"]
+    USE_COAT = True
+    print(f"✓ Coat — {full_train_r.shape}")
+except Exception as e:
+    print(f"⚠️  Coat unavailable: {e}")
+    syn = make_synthetic_mnar(n_users=500, n_items=200, n_factors=10, random_seed=RANDOM_SEED)
+    full_train_r    = syn["train_ratings"]
+    full_test_r     = syn["test_ratings"]
+    full_train_mask = syn["train_mask"]
+    full_test_mask  = syn["test_mask"]
+
+N_USERS = 50
+train_r    = full_train_r[:N_USERS]
+train_mask = full_train_mask[:N_USERS]
+test_r     = full_test_r[:N_USERS]
+test_mask  = full_test_mask[:N_USERS]
+
+dataset_name = "Coat" if USE_COAT else "Synthetic MNAR"
+print(f"Dataset: {dataset_name}  |  {N_USERS} users × {train_r.shape[1]} items")
+print(f"Train density: {train_mask.mean():.3f}  |  Test density: {test_mask.mean():.3f}")
+"""),
+
+        md("### 2 — Bayesian Propensity Model"),
+
+        code("""\
+print("Fitting BayesianPropensityModel …")
+prop_model = BayesianPropensityModel(random_seed=RANDOM_SEED)
+prop_model.build_model(train_mask)
+prop_trace = prop_model.fit(draws=500, tune=500, chains=2, target_accept=0.9)
+propensities = prop_model.propensity_scores()
+
+ece = expected_calibration_error(propensities.flatten(), train_mask.flatten().astype(int))
+print(f"\\nExpected Calibration Error (ECE): {ece:.4f}")
+print("(ECE closer to 0 = better calibration — essential for valid IPS correction)")
+"""),
+
+        code("""\
+# Propensity convergence diagnostics
+prop_summary = az.summary(prop_trace, var_names=["mu_alpha", "mu_beta", "sigma_alpha", "sigma_beta"])
+print("Propensity model convergence:")
+print(prop_summary[["mean","sd","r_hat","ess_bulk"]].to_string())
+"""),
+
+        code("""\
+plot_calibration_curve(
+    propensities.flatten(),
+    train_mask.flatten().astype(int),
+    "outputs/figures/calibration.png",
+)
+
+# Also show propensity heatmap for first 30 users / 50 items
+fig, ax = plt.subplots(figsize=(10, 4))
+im = ax.imshow(propensities[:30, :50], aspect="auto", cmap="YlOrRd")
+ax.set_xlabel("Item index (first 50)")
+ax.set_ylabel("User index (first 30)")
+ax.set_title("Posterior mean propensity P(O_{ui}=1) — heatmap")
+plt.colorbar(im, ax=ax, label="P(observed)")
+plt.tight_layout()
+plt.savefig("outputs/figures/02_propensity_heatmap.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        md("### 3 — Model comparison: Naive PMF vs IPS-PMF vs DR-PMF vs Deconfounded"),
+
+        code("""\
+results = {}
+
+# ── Naive PMF ────────────────────────────────────────────────────────
+print("Fitting Naive BayesianPMF …")
+naive = BayesianPMF(n_factors=10, random_seed=RANDOM_SEED)
+naive.build_model(train_r, train_mask)
+naive.fit(draws=500, tune=500, chains=2, target_accept=0.9)
+results["Naive PMF"] = {
+    "ndcg":   ndcg_at_k(naive, test_r, test_mask, k=10),
+    "recall": recall_at_k(naive, test_r, test_mask, k=10),
+    "rmse":   rmse_on_test(naive, test_r, test_mask),
+}
+naive_preds = naive._score_matrix()
+print(f"  Naive PMF — NDCG@10: {results['Naive PMF']['ndcg']:.4f}")
+"""),
+
+        code("""\
+# ── IPS-PMF ──────────────────────────────────────────────────────────
+print("Fitting IPS-BayesianPMF …")
+ips = IPSBayesianPMF(n_factors=10, random_seed=RANDOM_SEED)
+ips.build_model(train_r, train_mask, propensities, clip_max=5.0)
+ips.fit(draws=500, tune=500, chains=2, target_accept=0.9)
+results["IPS-PMF"] = {
+    "ndcg":   ndcg_at_k(ips, test_r, test_mask, k=10),
+    "recall": recall_at_k(ips, test_r, test_mask, k=10),
+    "rmse":   rmse_on_test(ips, test_r, test_mask),
+}
+print(f"  IPS-PMF — NDCG@10: {results['IPS-PMF']['ndcg']:.4f}")
+
+# DR-NDCG uses naive model predictions + IPS propensities
+dr_ndcg = doubly_robust_ndcg(naive_preds, propensities, test_r, test_mask, k=10)
+results["DR-NDCG (eval)"] = {"ndcg": dr_ndcg, "recall": None, "rmse": None}
+print(f"  DR-NDCG@10: {dr_ndcg:.4f}")
+"""),
+
+        code("""\
+# ── Deconfounded Recommender ─────────────────────────────────────────
+print("Fitting DeconfoundedRecommender …")
+deconf = DeconfoundedRecommender(n_factors=10, n_z_factors=5, random_seed=RANDOM_SEED)
+Z = deconf.fit_factor_model(train_mask)
+deconf.fit_outcome_model(train_r, train_mask, Z)
+
+class _DeconfWrapper:
+    def _score_matrix(self): return deconf._score_matrix()
+
+results["Deconfounded"] = {
+    "ndcg":   ndcg_at_k(_DeconfWrapper(), test_r, test_mask, k=10),
+    "recall": recall_at_k(_DeconfWrapper(), test_r, test_mask, k=10),
+    "rmse":   rmse_on_test(_DeconfWrapper(), test_r, test_mask),
+}
+print(f"  Deconfounded — NDCG@10: {results['Deconfounded']['ndcg']:.4f}")
+"""),
+
+        code("""\
+# ── Results table ────────────────────────────────────────────────────
+import pandas as pd
+rows = []
+for model_name, m in results.items():
+    rows.append({
+        "Model":     model_name,
+        "NDCG@10":  f"{m['ndcg']:.4f}",
+        "Recall@10": f"{m['recall']:.4f}" if m["recall"] is not None else "—",
+        "RMSE":      f"{m['rmse']:.4f}"  if m["rmse"]   is not None else "—",
+    })
+df_results = pd.DataFrame(rows).set_index("Model")
+print("\\nResults on unbiased test set:")
+print(df_results.to_string())
+print(f"\\nPropensity ECE: {ece:.4f}")
+"""),
+
+        code("""\
+# ── Bar chart comparison ─────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(9, 4))
+models = [m for m in results if results[m]["ndcg"] is not None]
+ndcgs  = [results[m]["ndcg"] for m in models]
+colors = ["steelblue", "darkorange", "seagreen", "mediumpurple"]
+bars = ax.bar(models, ndcgs, color=colors[:len(models)], alpha=0.85, edgecolor="white")
+for bar, val in zip(bars, ndcgs):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+            f"{val:.4f}", ha="center", va="bottom", fontsize=9)
+ax.set_ylabel("NDCG@10")
+ax.set_title(f"Model comparison — {dataset_name} unbiased test set")
+ax.set_ylim(0, max(ndcgs) * 1.15)
+plt.tight_layout()
+plt.savefig("outputs/figures/02_model_comparison.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        md("### 4 — Counterfactual relevance from the Deconfounded Recommender"),
+
+        code("""\
+# Show counterfactual relevance scores for 3 users
+sample_users = [0, 1, 2]
+n_items_show = 20
+
+fig, axes = plt.subplots(len(sample_users), 1, figsize=(14, 4*len(sample_users)))
+
+for ax, u in zip(axes, sample_users):
+    cf_scores = deconf.counterfactual_relevance(u, list(range(n_items_show)))
+    means, stds = cf_scores[:, 0], cf_scores[:, 1]
+
+    xs = np.arange(n_items_show)
+    ax.bar(xs, means, color="mediumpurple", alpha=0.7, label="E[R | do(A=1)] mean")
+    ax.vlines(xs, means - 1.88*stds, means + 1.88*stds, color="black",
+              linewidth=1.5, label="~94% credible interval")
+
+    # Highlight items in test set
+    in_test = np.where(test_mask[u, :n_items_show])[0]
+    if len(in_test) > 0:
+        ax.scatter(in_test, means[in_test] + 0.1, marker="*", color="darkorange",
+                   zorder=5, s=120, label="In test set")
+
+    ax.set_title(f"User {u} — Counterfactual relevance E[R | do(A=1)]")
+    ax.set_xlabel("Item index")
+    ax.set_ylabel("Interventional rating")
+    ax.set_xticks(xs)
+    ax.legend(fontsize=8)
+
+plt.suptitle("Counterfactual relevance scores (deconfounded)", fontsize=13, y=1.01)
+plt.tight_layout()
+plt.savefig("outputs/figures/02_counterfactual_relevance.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        md("""\
+### 5 — Identifiability caveat
+
+**⚠️  Important: The substitute-confounder approach has known limitations.**
+
+The deconfounded recommender assumes that Z (derived from the exposure
+matrix) captures *all* common causes of exposure and ratings.  In practice:
+
+- **Item-level confounders** (e.g., a marketing campaign affecting both
+  who sees an item and how they rate it) are not captured by user-factor Z.
+- **Ogburn et al. (2020)** showed that the substitute-confounder test
+  (checking that Z renders A independent of R) is not a valid falsification
+  test for causal identification — a model can pass the test and still
+  be causally mis-specified.
+
+**Why we still use it:**
+- It's an *improvement* over naive PMF even if not fully identified.
+- Evaluating on Coat's **uniform-random test set** (or Yahoo R3's random
+  subset) gives honest error estimates that don't suffer from MNAR bias —
+  this is the critical safeguard.
+- The approach is presented as an approximation with documented limitations,
+  not as ground-truth causal identification.
+
+**For production:** combine with A/B testing or bandit logs with logging
+propensities to achieve stronger causal guarantees (logged bandit feedback).
+"""),
+
+    ]
+    return nb
+
+
 # ── Entry point ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     save(make_00(), "notebooks/00_data_exploration.ipynb")
     save(make_01(), "notebooks/01_bayesian_pmf.ipynb")
+    save(make_02(), "notebooks/02_causal_debiasing.ipynb")
     print("Done.")
