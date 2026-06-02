@@ -10,9 +10,15 @@ import warnings
 from typing import Optional
 
 import arviz as az
+import jax
+import jax.numpy as jnp
+import numpyro
+import numpyro.distributions as dist
 import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
+from numpyro.infer import SVI, Trace_ELBO
+from numpyro.infer.autoguide import AutoNormal
 
 
 class BayesianPMF:
@@ -294,3 +300,200 @@ class IPSBayesianPMF(BayesianPMF):
 
         self.model = model
         return model
+
+
+class NumPyroPMF:
+    """Bayesian PMF via NumPyro SVI for fast approximate inference.
+
+    Used inside the feedback-loop simulation where running full NUTS per round
+    would take hours.  A mean-field AutoNormal guide (diagonal-covariance
+    normal over U and V) is trained with Adam + ELBO for n_steps iterations.
+
+    Trade-off vs PyMC NUTS:
+        PyMC NUTS: asymptotically exact posterior, calibrated uncertainty, slow.
+        NumPyro SVI: mean-field approximation (underestimates posterior variance),
+                     fast (~30s on CPU), scales via subsampling.
+
+    This underestimation means Thompson Sampling via SVI explores less
+    aggressively than exact NUTS would, but it is the practical choice for
+    interactive simulation (10 rounds × 3 strategies).
+
+    Args:
+        n_factors: Latent factor dimension.
+        random_seed: Seed for JAX PRNG.
+        n_steps: SVI training iterations.
+        learning_rate: Adam learning rate.
+    """
+
+    def __init__(
+        self,
+        n_factors: int = 10,
+        random_seed: int = 42,
+        n_steps: int = 1000,
+        learning_rate: float = 1e-2,
+    ) -> None:
+        self.n_factors = n_factors
+        self.random_seed = random_seed
+        self.n_steps = n_steps
+        self.learning_rate = learning_rate
+
+        self._n_users: Optional[int] = None
+        self._n_items: Optional[int] = None
+        self._svi_result = None
+        self._guide = None
+        self._model_fn = None
+
+    # ------------------------------------------------------------------
+    # NumPyro model
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pmf_model(
+        user_idx: np.ndarray,
+        item_idx: np.ndarray,
+        ratings_obs: np.ndarray,
+        n_users: int,
+        n_items: int,
+        n_factors: int,
+    ) -> None:
+        """NumPyro generative model for Bayesian PMF."""
+        sigma_u = numpyro.sample("sigma_u", dist.HalfNormal(1.0))
+        sigma_v = numpyro.sample("sigma_v", dist.HalfNormal(1.0))
+        tau = numpyro.sample("tau", dist.HalfNormal(1.0))
+
+        U = numpyro.sample(
+            "U", dist.Normal(jnp.zeros((n_users, n_factors)), sigma_u)
+        )
+        V = numpyro.sample(
+            "V", dist.Normal(jnp.zeros((n_items, n_factors)), sigma_v)
+        )
+
+        r_hat = jnp.sum(U[user_idx] * V[item_idx], axis=-1)
+        numpyro.sample(
+            "obs",
+            dist.Normal(r_hat, 1.0 / (tau + 1e-6)),
+            obs=ratings_obs,
+        )
+
+    # ------------------------------------------------------------------
+    # Fit
+    # ------------------------------------------------------------------
+
+    def fit(self, ratings: np.ndarray, mask: np.ndarray) -> None:
+        """Fit via SVI (Adam + ELBO) on the observed (user, item) ratings.
+
+        Args:
+            ratings: Dense (n_users, n_items) matrix; 0 where unobserved.
+            mask: Boolean (n_users, n_items); True where observed.
+        """
+        n_users, n_items = ratings.shape
+        self._n_users = n_users
+        self._n_items = n_items
+
+        user_idx, item_idx = np.where(mask)
+        ratings_obs = ratings[user_idx, item_idx].astype(np.float32)
+
+        user_idx_jnp = jnp.array(user_idx)
+        item_idx_jnp = jnp.array(item_idx)
+        ratings_jnp = jnp.array(ratings_obs)
+
+        def model():
+            return NumPyroPMF._pmf_model(
+                user_idx_jnp, item_idx_jnp, ratings_jnp,
+                n_users, n_items, self.n_factors,
+            )
+
+        guide = AutoNormal(model)
+        optimizer = numpyro.optim.Adam(self.learning_rate)
+        svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
+
+        rng_key = jax.random.PRNGKey(self.random_seed)
+        # svi.run() uses lax.scan internally — JIT-compiled, much faster than
+        # a Python for-loop over svi.update() on first call and all subsequent.
+        svi_result = svi.run(rng_key, self.n_steps, progress_bar=False)
+
+        self._svi_result = svi_result.params
+        self._guide = guide
+        self._model_fn = model
+
+    # ------------------------------------------------------------------
+    # Prediction helpers
+    # ------------------------------------------------------------------
+
+    def _posterior_samples(
+        self, n_samples: int = 50, rng_key: Optional[jax.Array] = None
+    ) -> dict:
+        """Draw samples from the variational posterior.
+
+        Args:
+            n_samples: Number of samples to draw.
+            rng_key: JAX PRNGKey; defaults to a key derived from random_seed.
+
+        Returns:
+            Dict with keys 'U' (n_samples, n_users, K) and 'V' (n_samples, n_items, K).
+        """
+        if self._guide is None:
+            raise RuntimeError("Call fit() before sampling.")
+        if rng_key is None:
+            rng_key = jax.random.PRNGKey(self.random_seed + 1)
+
+        predictive = numpyro.infer.Predictive(
+            self._guide, params=self._svi_result, num_samples=n_samples
+        )
+        samples = predictive(rng_key)
+        return {
+            "U": np.array(samples["U"]),  # (n_samples, n_users, K)
+            "V": np.array(samples["V"]),  # (n_samples, n_items, K)
+        }
+
+    def _score_matrix(self, n_samples: int = 50) -> np.ndarray:
+        """(n_users × n_items) score matrix averaged over posterior samples.
+
+        Args:
+            n_samples: Number of variational posterior samples to average.
+
+        Returns:
+            Float array of shape (n_users, n_items).
+        """
+        samples = self._posterior_samples(n_samples)
+        U_mean = samples["U"].mean(axis=0)  # (n_users, K)
+        V_mean = samples["V"].mean(axis=0)  # (n_items, K)
+        return U_mean @ V_mean.T
+
+    def recommend_greedy(self, user_idx: int, k: int = 10) -> list[int]:
+        """Top-k items by posterior-mean score (exploitation baseline).
+
+        Args:
+            user_idx: Zero-based user index.
+            k: Number of items to recommend.
+
+        Returns:
+            Item indices sorted descending by mean score.
+        """
+        scores = self._score_matrix()[user_idx]
+        return list(np.argsort(scores)[::-1][:k])
+
+    def recommend_thompson(
+        self,
+        user_idx: int,
+        k: int = 10,
+        rng_key: Optional[jax.Array] = None,
+    ) -> list[int]:
+        """Thompson Sampling: draw one posterior sample, score all items.
+
+        Args:
+            user_idx: Zero-based user index.
+            k: Number of items to recommend.
+            rng_key: JAX PRNGKey for this recommendation step.
+
+        Returns:
+            Item indices sorted descending by sampled score.
+        """
+        if rng_key is None:
+            rng_key = jax.random.PRNGKey(self.random_seed)
+
+        samples = self._posterior_samples(n_samples=1, rng_key=rng_key)
+        U_sample = samples["U"][0, user_idx, :]  # (K,)
+        V_sample = samples["V"][0]               # (n_items, K)
+        scores = V_sample @ U_sample
+        return list(np.argsort(scores)[::-1][:k])

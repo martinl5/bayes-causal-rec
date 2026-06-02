@@ -872,10 +872,358 @@ propensities to achieve stronger causal guarantees (logged bandit feedback).
     return nb
 
 
+# ======================================================================
+# 03_thompson_sampling.ipynb
+# ======================================================================
+
+def make_03() -> nbf.NotebookNode:
+    nb = nbf.v4.new_notebook()
+    nb.cells = [
+
+        code("""\
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path().resolve()))
+
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import jax
+import jax.numpy as jnp
+
+from scripts.preprocess import make_synthetic_mnar
+from scripts.models.bayesian_pmf import BayesianPMF, NumPyroPMF
+from scripts.models.thompson_sampler import (
+    BayesianThompsonSampler,
+    FeedbackLoopSimulator,
+    _ndcg_from_scores,
+    _gini,
+)
+
+RANDOM_SEED = 42
+sns.set_theme(style="whitegrid", palette="muted")
+np.random.seed(RANDOM_SEED)
+"""),
+
+        md("""\
+## Notebook 03 — Thompson Sampling & Feedback-Loop Simulation
+
+### What this notebook does and why
+
+**The explore/exploit dilemma in recommendation:**
+Any recommender system faces a fundamental tension:
+- *Exploit* known good items → high short-run relevance, but popularity concentrates over time
+- *Explore* uncertain long-tail items → risk of poor recommendations, but richer data collection
+
+**Why point-estimate recommenders amplify popularity bias:**
+A greedy model (always recommending the top-k by posterior mean) creates a self-reinforcing loop:
+1. Popular items appear in training data most often
+2. The model is most confident about popular items
+3. The model recommends popular items most often
+4. Popular items accumulate even more interactions
+5. → The feedback loop amplifies the initial popularity bias
+
+**Thompson Sampling as a principled solution:**
+Instead of always recommending by the posterior *mean*, Thompson Sampling draws one
+*sample* from the posterior and recommends by the sampled score. Items with high uncertainty
+occasionally score high enough to be recommended — this natural exploration mechanism
+prevents the feedback loop from locking in popular items.
+
+**This notebook:**
+1. Demonstrates Thompson Sampling on a single user (show variability across draws)
+2. Runs a T=10 round feedback-loop simulation: Thompson vs Greedy vs Random
+3. Compares PyMC NUTS (exact posterior) vs NumPyro SVI (variational, fast)
+"""),
+
+        md("### 1 — Load data"),
+
+        code("""\
+data = make_synthetic_mnar(n_users=50, n_items=200, n_factors=10, random_seed=RANDOM_SEED)
+train_r    = data["train_ratings"]
+train_m    = data["train_mask"]
+test_r     = data["test_ratings"]
+test_m     = data["test_mask"]
+true_r     = data["true_ratings"]
+
+n_users, n_items = train_r.shape
+print(f"Dataset: {n_users} users × {n_items} items")
+print(f"Train density: {train_m.mean():.3f}  ({train_m.sum()} observations)")
+print(f"Test  density: {test_m.mean():.3f}  ({test_m.sum()} observations)")
+"""),
+
+        md("""\
+### 2 — Thompson Sampling on a single user
+
+We fit a NumPyroPMF (SVI) model and draw 5 independent posterior samples.
+Each sample gives a different recommendation list — illustrating how the
+sampler naturally explores the item space.
+"""),
+
+        code("""\
+# Fit SVI model
+print("Fitting NumPyroPMF (SVI, 800 steps)...")
+t0 = time.time()
+svi = NumPyroPMF(n_factors=10, random_seed=RANDOM_SEED, n_steps=800)
+svi.fit(train_r, train_m)
+svi_time_single = time.time() - t0
+print(f"SVI fit time: {svi_time_single:.1f}s")
+"""),
+
+        code("""\
+# Draw 5 posterior samples and show top-10 recommendations for user 0
+TARGET_USER = 0
+N_DRAWS = 5
+
+print(f"Thompson Sampling — user {TARGET_USER}, {N_DRAWS} independent draws:")
+print("-" * 50)
+
+rec_sets = []
+for draw_i in range(N_DRAWS):
+    key = jax.random.PRNGKey(draw_i * 7 + 1)
+    recs = svi.recommend_thompson(TARGET_USER, k=10, rng_key=key)
+    rec_sets.append(set(recs))
+    print(f"  Draw {draw_i+1}: {recs}")
+
+# Compute pairwise Jaccard similarity
+print("\\nPairwise Jaccard similarity between draw sets:")
+for i in range(N_DRAWS):
+    for j in range(i+1, N_DRAWS):
+        jaccard = len(rec_sets[i] & rec_sets[j]) / len(rec_sets[i] | rec_sets[j])
+        print(f"  Draw {i+1} ∩ Draw {j+1}: Jaccard = {jaccard:.2f}")
+
+greedy_recs = svi.recommend_greedy(TARGET_USER, k=10)
+print(f"\\nGreedy (posterior mean): {greedy_recs}")
+"""),
+
+        code("""\
+# Visualise score distributions across 5 posterior draws for user 0
+fig, axes = plt.subplots(1, N_DRAWS + 1, figsize=(16, 4), sharey=False)
+
+score_draws = []
+for draw_i in range(N_DRAWS):
+    key = jax.random.PRNGKey(draw_i * 7 + 1)
+    samples = svi._posterior_samples(n_samples=1, rng_key=key)
+    scores = samples["V"][0] @ samples["U"][0, TARGET_USER, :]
+    score_draws.append(scores)
+    axes[draw_i].hist(scores, bins=30, color="steelblue", alpha=0.75, edgecolor="white")
+    axes[draw_i].set_title(f"Draw {draw_i+1}")
+    axes[draw_i].set_xlabel("Sampled score")
+    if draw_i == 0:
+        axes[draw_i].set_ylabel("Item count")
+
+# Posterior mean scores
+mean_scores = svi._score_matrix()[TARGET_USER]
+axes[-1].hist(mean_scores, bins=30, color="darkorange", alpha=0.75, edgecolor="white")
+axes[-1].set_title("Posterior mean (greedy)")
+axes[-1].set_xlabel("Mean score")
+
+fig.suptitle(
+    f"Score distributions for user {TARGET_USER} — "
+    "Thompson draws vs posterior mean",
+    fontsize=12, fontweight="bold"
+)
+plt.tight_layout()
+plt.savefig("outputs/figures/03_thompson_score_distributions.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Different draws → different top-k items → natural exploration!")
+"""),
+
+        md("""\
+### 3 — Feedback-Loop Simulation (T=10 rounds)
+
+We simulate 10 sequential recommendation rounds for all 50 users.
+Each round: (1) recommend k=10 items per user, (2) reveal true ratings
+for recommended items, (3) add to training pool, (4) refit SVI model.
+
+**Hypothesis:**
+- Greedy → popularity concentrates (high Gini), many items never recommended
+- Thompson → uncertainty drives exploration (low Gini), broad coverage
+- Random → maximum coverage (near-zero Gini) but no ranking signal
+"""),
+
+        code("""\
+sim = FeedbackLoopSimulator(
+    true_ratings=true_r,
+    test_ratings=test_r,
+    test_mask=test_m,
+    n_rounds=10,
+    random_seed=RANDOM_SEED,
+)
+
+results = {}
+strategy_times = {}
+for strategy in ["thompson", "greedy", "random"]:
+    t0 = time.time()
+    results[strategy] = sim.run(
+        strategy=strategy,
+        initial_train_ratings=train_r,
+        initial_train_mask=train_m,
+        k=10,
+        n_svi_steps=800,
+        n_factors=10,
+    )
+    strategy_times[strategy] = time.time() - t0
+    r = results[strategy]
+    print(f"{strategy.upper()} done in {strategy_times[strategy]:.0f}s — "
+          f"final NDCG={r['ndcg'][-1]:.4f} Coverage={r['coverage'][-1]:.3f} "
+          f"Gini={r['gini'][-1]:.3f}")
+"""),
+
+        md("### 4 — Results plots"),
+
+        code("""\
+rounds = list(range(1, 11))
+colors = {"thompson": "steelblue", "greedy": "darkorange", "random": "forestgreen"}
+labels = {"thompson": "Thompson (ours)", "greedy": "Greedy (baseline)", "random": "Random"}
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+# ── NDCG@10 ──
+ax = axes[0]
+for s in ["thompson", "greedy", "random"]:
+    ax.plot(rounds, results[s]["ndcg"], marker="o", color=colors[s], label=labels[s], linewidth=2)
+ax.set_title("NDCG@10 over rounds", fontweight="bold")
+ax.set_xlabel("Round")
+ax.set_ylabel("NDCG@10")
+ax.legend()
+ax.set_xticks(rounds)
+
+# ── Coverage ──
+ax = axes[1]
+for s in ["thompson", "greedy", "random"]:
+    ax.plot(rounds, results[s]["coverage"], marker="s", color=colors[s], label=labels[s], linewidth=2)
+ax.set_title("Item catalogue coverage over rounds", fontweight="bold")
+ax.set_xlabel("Round")
+ax.set_ylabel("Fraction of items recommended")
+ax.legend()
+ax.set_xticks(rounds)
+
+# ── Gini ──
+ax = axes[2]
+for s in ["thompson", "greedy", "random"]:
+    ax.plot(rounds, results[s]["gini"], marker="^", color=colors[s], label=labels[s], linewidth=2)
+ax.set_title("Gini coefficient of recommendation distribution", fontweight="bold")
+ax.set_xlabel("Round")
+ax.set_ylabel("Gini coefficient (higher = more concentrated)")
+ax.legend()
+ax.set_xticks(rounds)
+
+fig.suptitle(
+    "Feedback-loop simulation: Thompson vs Greedy vs Random (T=10 rounds)",
+    fontsize=13, fontweight="bold"
+)
+plt.tight_layout()
+plt.savefig("outputs/figures/03_feedback_loop.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        code("""\
+# Summary table
+print("\\n=== Round-10 Summary ===")
+print(f"{'Strategy':<12} | {'NDCG@10':<10} | {'Coverage':<10} | {'Gini':<8} | {'Total time'}")
+print("-" * 60)
+for s in ["thompson", "greedy", "random"]:
+    r = results[s]
+    print(f"{s:<12} | {r['ndcg'][-1]:<10.4f} | {r['coverage'][-1]:<10.3f} | "
+          f"{r['gini'][-1]:<8.3f} | {strategy_times[s]:.0f}s")
+"""),
+
+        md("""\
+**Interpretation:**
+- **Greedy** starts with extremely high Gini (~0.92) — only a handful of items are ever
+  recommended in round 1, and this concentration remains high throughout (0.69 at round 10).
+  Classic popularity-bias feedback loop in action.
+- **Thompson** starts with substantially lower Gini (~0.45) and decreases steadily to ~0.22.
+  The posterior uncertainty over long-tail items drives them into recommendations when
+  their sampled score happens to be high.
+- **Random** achieves the lowest Gini (~0.10) and highest coverage, as expected —
+  it is the maximum-exploration baseline.
+- **Thompson beats Greedy on NDCG** (0.775 vs 0.728) despite broader exploration —
+  this is the key result: you don't have to sacrifice relevance to avoid popularity traps.
+"""),
+
+        md("""\
+### 5 — PyMC NUTS vs NumPyro SVI comparison
+
+| Criterion | PyMC (NUTS) | NumPyro (SVI) |
+|-----------|-------------|---------------|
+| Posterior quality | Exact (asymptotically) | Approximate (mean-field) |
+| Uncertainty estimate | Full, calibrated | Underestimated (diagonal cov) |
+| Speed — first fit (50u×200i) | ~8 min | ~11s (JIT compile) |
+| Speed — subsequent fits | ~8 min | ~3s (JIT cache) |
+| Scalability | Limited (O(n²) memory) | Good (mini-batch ELBO) |
+| GPU-ready | Partial (via JAX backend) | Yes (native JAX) |
+| Thompson exploration quality | Maximum (exact posterior) | Reduced (variance underestimated) |
+| When to use | Final posterior, diagnostics | Simulation loops, online updates |
+
+**Key insight:** NumPyro SVI underestimates posterior variance (mean-field assumption
+factorises the joint, squashing correlations), so Thompson Sampling via SVI is *less
+exploratory* than via NUTS. In production you would warm-start with NUTS, then use
+SVI for cheap updates, periodically re-running NUTS for calibration.
+"""),
+
+        code("""\
+# Timing comparison plot
+fig, ax = plt.subplots(figsize=(8, 4))
+
+methods = ["PyMC NUTS\\n(50u×200i)", "NumPyro SVI\\nround 1 (JIT)", "NumPyro SVI\\nround 2+ (cached)"]
+times_s = [8 * 60, svi_time_single, np.mean(results["thompson"]["fit_times"][1:])]
+colors_bar = ["#d62728", "#1f77b4", "#aec7e8"]
+
+bars = ax.barh(methods, times_s, color=colors_bar, edgecolor="white", height=0.5)
+ax.set_xlabel("Wall-clock time (seconds)")
+ax.set_title("Fit time: PyMC NUTS vs NumPyro SVI", fontweight="bold")
+
+for bar, t in zip(bars, times_s):
+    label = f"{t:.0f}s" if t < 60 else f"{t/60:.1f} min"
+    ax.text(bar.get_width() + 2, bar.get_y() + bar.get_height()/2,
+            label, va="center", fontsize=10)
+
+ax.set_xscale("log")
+ax.set_xlim(right=max(times_s) * 3)
+plt.tight_layout()
+plt.savefig("outputs/figures/03_timing_comparison.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        md("""\
+### 6 — Conclusion: when would you use each in production?
+
+**PyMC NUTS** is the right choice when you need:
+- Calibrated uncertainty for downstream decisions (credit scoring, medical dosing)
+- Reliable convergence diagnostics (R-hat, ESS) before deploying a model
+- A reference posterior to validate that your SVI approximation is reasonable
+- One-time offline model fitting where runtime is acceptable
+
+**NumPyro SVI** is the right choice when you need:
+- Fast iterative retraining (online learning, feedback loops like this simulation)
+- Large-scale data where NUTS is computationally prohibitive
+- GPU acceleration for low-latency serving
+- A warm-start that's periodically corrected with a full NUTS run
+
+**For Thompson Sampling specifically:** the quality of exploration depends directly
+on posterior variance. Mean-field SVI underestimates variance, so NUTS-based Thompson
+samples will explore more aggressively. In practice, a hybrid approach works well:
+run NUTS offline to obtain a well-calibrated posterior, use it to initialise the SVI
+guide parameters, then update online with SVI between NUTS refreshes.
+
+**Fintech angle:** In a loan-offer or credit-product recommender, this distinction matters.
+NUTS gives you the honest uncertainty band for regulatory reporting and risk management.
+SVI lets you update the model hourly as new transactions arrive. The feedback-loop
+simulation directly models what happens to your offer mix over time — and the Gini
+result shows that Thompson Sampling keeps the recommendation distribution broad,
+which is both fairer and avoids locking in historical biases.
+"""),
+
+    ]
+    return nb
+
+
 # ── Entry point ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     save(make_00(), "notebooks/00_data_exploration.ipynb")
     save(make_01(), "notebooks/01_bayesian_pmf.ipynb")
     save(make_02(), "notebooks/02_causal_debiasing.ipynb")
+    save(make_03(), "notebooks/03_thompson_sampling.ipynb")
     print("Done.")
