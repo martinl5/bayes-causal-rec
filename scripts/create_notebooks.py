@@ -1219,6 +1219,443 @@ which is both fairer and avoids locking in historical biases.
     return nb
 
 
+# ======================================================================
+# 04_fintech_framing.ipynb
+# ======================================================================
+
+def make_04() -> nbf.NotebookNode:
+    nb = nbf.v4.new_notebook()
+    nb.cells = [
+
+        code("""\
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path().resolve()))
+
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import scipy.special
+
+from scripts.preprocess import make_synthetic_mnar
+from scripts.models.propensity import BayesianPropensityModel
+
+RANDOM_SEED = 42
+sns.set_theme(style="whitegrid", palette="muted")
+np.random.seed(RANDOM_SEED)
+"""),
+
+        md("""\
+## Notebook 04 — Fintech Framing
+
+### What this notebook does and why
+
+This notebook translates every technical component of the project into the language
+of banking and fintech — for interviews with Grab, GXS, Google, and DeepMind.
+The core insight is that **product recommendation** (which savings account to surface
+to which customer) is mathematically identical to **item recommendation** (which
+movie to show to which user), with the same MNAR confounding, the same need for
+calibrated uncertainty, and the same explore/exploit tension.
+
+We then work through a concrete example: estimating the **true conversion rate**
+for a savings product offer, corrected for the fact that it was historically only
+offered to high-balance customers — a classic case of MNAR confounding in fintech.
+"""),
+
+        md("""\
+### 1 — Component mapping: RecSys → Fintech
+
+| Project Component | Fintech Equivalent |
+|---|---|
+| Item recommendation | Next-best-action: product to surface (card, loan, savings, insurance) |
+| MNAR exposure bias | Selection bias: products historically offered only to low-risk or high-balance customers |
+| Observation mask O_{ui} | Whether a customer was ever **offered** product i |
+| Propensity P(O=1 \\| u, i) | P(product was offered to customer) — models historical offer policy |
+| IPS debiasing | Correcting for offer selection bias in conversion rate models |
+| Deconfounded recommender | Removing the confound from "who received a FlexiLoan offer" |
+| Thompson Sampling | Explore/exploit on offers under risk and regulatory constraints |
+| Posterior uncertainty | Uncertainty-aware credit limit / pricing / CLV estimates |
+| Gini coefficient | Fairness metric: are we offering products to a narrow demographic only? |
+| Feedback loop simulation | What happens to the offer mix after 10 quarters of model-driven offers? |
+
+**Why this matters for Grab / GXS:**
+Grab's lending arm (GXS Bank) issues loans based on ride/food transaction signals.
+The historical offer policy (loan only to established drivers) creates MNAR in the
+training data — drivers who were never offered a loan have no outcome label.
+Naive conversion models trained on this data overestimate conversion for low-risk
+profiles and underestimate for under-served segments. IPS correction and the
+deconfounded recommender directly address this.
+"""),
+
+        md("""\
+### 2 — The MNAR problem in fintech (with DAG)
+
+**Scenario:** A bank has historically offered its FlexiSavings product only to
+customers with monthly balance > $5,000. We now want to estimate: "what is the
+true conversion rate across *all* customers if we offered FlexiSavings to everyone?"
+
+This is the classic **Missing Not At Random** problem:
+- The outcome (did the customer open the account?) is only observed for customers
+  who received the offer.
+- But receiving the offer depended on balance — a confounder.
+- A naive model trained only on offer-recipients will be biased toward high-balance
+  customers and will over-predict conversion for low-balance customers who were
+  never offered the product.
+
+The DAG below shows the confounding structure.
+"""),
+
+        code("""\
+# Draw the fintech MNAR DAG
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.set_xlim(0, 10)
+ax.set_ylim(0, 6)
+ax.axis("off")
+
+nodes = {
+    "Balance\\n(confounder)": (5, 5),
+    "Offer\\nreceived": (3, 3),
+    "Conversion\\n(outcome)": (7, 3),
+    "Customer\\nfeatures": (1, 1),
+    "Product\\nfeatures": (9, 1),
+}
+colors = {
+    "Balance\\n(confounder)": "#d62728",
+    "Offer\\nreceived": "#1f77b4",
+    "Conversion\\n(outcome)": "#2ca02c",
+    "Customer\\nfeatures": "#7f7f7f",
+    "Product\\nfeatures": "#7f7f7f",
+}
+for label, (x, y) in nodes.items():
+    ax.add_patch(plt.Circle((x, y), 0.65, color=colors[label], alpha=0.85, zorder=3))
+    ax.text(x, y, label, ha="center", va="center", fontsize=8.5,
+            fontweight="bold", color="white", zorder=4)
+
+edges = [
+    ("Balance\\n(confounder)", "Offer\\nreceived"),
+    ("Balance\\n(confounder)", "Conversion\\n(outcome)"),
+    ("Offer\\nreceived", "Conversion\\n(outcome)"),
+    ("Customer\\nfeatures", "Offer\\nreceived"),
+    ("Customer\\nfeatures", "Conversion\\n(outcome)"),
+    ("Product\\nfeatures", "Conversion\\n(outcome)"),
+]
+for src, dst in edges:
+    x0, y0 = nodes[src]
+    x1, y1 = nodes[dst]
+    dx, dy = x1 - x0, y1 - y0
+    length = (dx**2 + dy**2)**0.5
+    ux, uy = dx/length, dy/length
+    ax.annotate(
+        "", xy=(x1 - 0.7*ux, y1 - 0.7*uy),
+        xytext=(x0 + 0.7*ux, y0 + 0.7*uy),
+        arrowprops=dict(arrowstyle="->", lw=1.8, color="#333333"),
+    )
+
+ax.set_title(
+    "Fintech MNAR DAG: balance confounds offer policy and conversion",
+    fontsize=12, fontweight="bold"
+)
+plt.tight_layout()
+plt.savefig("outputs/figures/04_fintech_dag.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print(""\"
+Intervention of interest: do(Offer=1) — what is E[Conversion | do(Offer=1)]?
+Naive estimator: E[Conversion | Offer=1] — biased by balance confounder.
+Corrected estimator: use IPS or deconfounder to adjust for offer selection policy.
+\""")
+"""),
+
+        md("""\
+### 3 — Worked example: correcting offer selection bias
+
+We generate a synthetic bank dataset where:
+- 300 customers, 5 products (savings, card, loan, insurance, FX)
+- Offer policy is balance-driven: high-balance customers are offered all products;
+  low-balance customers are rarely offered loans or premium cards
+- True conversion rates are drawn from a Bayesian factor model (unbiased)
+- Observed conversion rates in biased training data differ from truth
+
+We then apply the **Bayesian propensity model** to estimate P(offered | customer),
+compute IPS weights, and show that the corrected conversion estimate is closer to
+the unbiased ground truth.
+"""),
+
+        code("""\
+rng = np.random.default_rng(RANDOM_SEED)
+N_CUSTOMERS = 300
+N_PRODUCTS = 5
+PRODUCT_NAMES = ["FlexiSavings", "PremiumCard", "MicroLoan", "TravelInsurance", "FX Transfer"]
+
+# Customer features
+balance = rng.lognormal(mean=8.5, sigma=1.2, size=N_CUSTOMERS)  # log-normal, mean ~$5k
+balance_norm = (balance - balance.min()) / (balance.max() - balance.min())
+
+# True latent factor model: U (customers) x V (products)
+K = 3
+U_true = rng.normal(0, 1, (N_CUSTOMERS, K))
+V_true = rng.normal(0, 1, (N_PRODUCTS, K))
+true_scores = scipy.special.expit(U_true @ V_true.T + 0.5 * balance_norm[:, None])
+print(f"True conversion rates (mean per product): {true_scores.mean(axis=0).round(3)}")
+
+# Biased offer policy: P(offer) depends on balance
+offer_logit = -2.0 + 3.0 * balance_norm
+# Penalise high-risk products (loan, premium card) for low-balance customers
+product_bias = np.array([0.5, -0.5, -1.5, 0.0, 0.3])
+offer_prob = scipy.special.expit(offer_logit[:, None] + product_bias[None, :])
+offer_mask = rng.random((N_CUSTOMERS, N_PRODUCTS)) < offer_prob
+
+print(f"Offer density: {offer_mask.mean():.3f} ({offer_mask.sum()} / {N_CUSTOMERS*N_PRODUCTS})")
+
+# Observed conversions (only for offered customers)
+conversion_prob = true_scores * offer_mask.astype(float)
+observed_conversion = (rng.random((N_CUSTOMERS, N_PRODUCTS)) < conversion_prob) * offer_mask
+print(f"Observed conversions: {observed_conversion.sum()} total")
+
+# Naive conversion rate (biased: only observed offers)
+naive_rate = observed_conversion.sum(axis=0) / np.maximum(offer_mask.sum(axis=0), 1)
+true_rate = true_scores.mean(axis=0)
+
+print("\\nProduct-level conversion rates:")
+print(f"{'Product':<20} {'True rate':>10} {'Naive rate':>12} {'Bias':>8}")
+print("-" * 54)
+for j, name in enumerate(PRODUCT_NAMES):
+    bias = naive_rate[j] - true_rate[j]
+    print(f"{name:<20} {true_rate[j]:>10.3f} {naive_rate[j]:>12.3f} {bias:>+8.3f}")
+"""),
+
+        code("""\
+# IPS correction using known offer propensities (oracle version)
+# In practice: estimated from BayesianPropensityModel
+ips_weights = np.where(
+    offer_mask,
+    np.clip(1.0 / np.maximum(offer_prob, 1e-3), 1.0, 5.0),
+    0.0,
+)
+
+ips_num = (observed_conversion * ips_weights).sum(axis=0)
+ips_den = (offer_mask * ips_weights).sum(axis=0)
+ips_rate = ips_num / np.maximum(ips_den, 1.0)
+
+print("IPS-corrected vs naive vs true conversion rates:")
+print(f"{'Product':<20} {'True':>8} {'Naive':>8} {'IPS':>8} {'IPS error':>12} {'Naive error':>12}")
+print("-" * 72)
+for j, name in enumerate(PRODUCT_NAMES):
+    print(f"{name:<20} {true_rate[j]:>8.3f} {naive_rate[j]:>8.3f} {ips_rate[j]:>8.3f} "
+          f"{abs(ips_rate[j]-true_rate[j]):>12.3f} {abs(naive_rate[j]-true_rate[j]):>12.3f}")
+
+naive_mae = np.abs(naive_rate - true_rate).mean()
+ips_mae = np.abs(ips_rate - true_rate).mean()
+print(f"\\nMean absolute error — Naive: {naive_mae:.4f}  IPS: {ips_mae:.4f}")
+print(f"IPS reduces MAE by {(1 - ips_mae/naive_mae)*100:.1f}% vs naive")
+"""),
+
+        code("""\
+# Visualise the bias correction
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+x = np.arange(N_PRODUCTS)
+w = 0.28
+ax = axes[0]
+ax.bar(x - w, true_rate, width=w, label="True (population avg)", color="#2ca02c", alpha=0.85)
+ax.bar(x,     naive_rate, width=w, label="Naive (biased)", color="#d62728", alpha=0.85)
+ax.bar(x + w, ips_rate,   width=w, label="IPS-corrected", color="#1f77b4", alpha=0.85)
+ax.set_xticks(x)
+ax.set_xticklabels(PRODUCT_NAMES, rotation=15, ha="right")
+ax.set_ylabel("Conversion rate")
+ax.set_title("Product conversion rates: true vs naive vs IPS", fontweight="bold")
+ax.legend()
+
+# Show bias by product — scatter
+ax2 = axes[1]
+ax2.scatter(true_rate, naive_rate, marker="^", s=80, color="#d62728",
+            label="Naive", zorder=3)
+ax2.scatter(true_rate, ips_rate,   marker="o", s=80, color="#1f77b4",
+            label="IPS-corrected", zorder=3)
+lims = [min(true_rate.min(), ips_rate.min(), naive_rate.min()) - 0.02,
+        max(true_rate.max(), ips_rate.max(), naive_rate.max()) + 0.02]
+ax2.plot(lims, lims, "k--", alpha=0.4, label="Perfect calibration")
+ax2.set_xlabel("True conversion rate")
+ax2.set_ylabel("Estimated conversion rate")
+ax2.set_title("Calibration: naive vs IPS", fontweight="bold")
+ax2.legend()
+for j, name in enumerate(PRODUCT_NAMES):
+    ax2.annotate(PRODUCT_NAMES[j].split()[0], (true_rate[j], naive_rate[j]),
+                 fontsize=7.5, color="#d62728",
+                 xytext=(4, 4), textcoords="offset points")
+
+plt.tight_layout()
+plt.savefig("outputs/figures/04_ips_correction.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        md("""\
+### 4 — Thompson Sampling in a fintech context
+
+**The explore/exploit problem for product offers:**
+
+A greedy bank always surfaces the product with the highest expected conversion —
+but this locks in the historical popularity of well-known products (e.g. savings
+accounts) and never discovers which customers would respond to newer products
+(e.g. FX Transfer, MicroLoan).
+
+Over time, this creates a feedback loop:
+1. FlexiSavings has lots of historical offer data → model is confident → always offered
+2. MicroLoan rarely offered → little data → model uncertain → never offered
+3. MicroLoan may actually convert well for an under-served segment — we never find out
+
+**Thompson Sampling breaks this loop:**
+- The posterior over U[customer] × V[product] factors has high variance for
+  under-observed products.
+- When MicroLoan's sampled score occasionally spikes above FlexiSavings, it gets offered.
+- New data reduces uncertainty → model learns the true conversion rate.
+- The Gini coefficient of the offer distribution stays low (diverse product mix).
+
+**Regulatory angle:**
+In many jurisdictions, lenders must demonstrate that credit products are offered
+fairly across demographic groups. A high Gini coefficient in the offer distribution
+is a regulatory risk. Thompson Sampling's exploration directly reduces this risk
+by keeping the offer mix broad — a point you can make explicitly in a Grab/GXS
+interview when discussing fairness in lending.
+"""),
+
+        code("""\
+# Simulate a simplified 5-round offer feedback loop with Thompson vs Greedy
+# (illustrative, using known true_scores as oracle)
+
+rng2 = np.random.default_rng(RANDOM_SEED + 1)
+N_ROUNDS = 5
+K_OFFERS = 2  # offer 2 products per customer per round
+
+def simulate_fintech_loop(strategy, true_scores, rng, n_rounds=5, k=2):
+    n_cust, n_prod = true_scores.shape
+    # Start with biased historical data
+    obs_mask = offer_mask.copy()
+    obs_conv = observed_conversion.copy().astype(float)
+
+    round_offer_counts = []
+    for t in range(n_rounds):
+        # Estimate conversion rate from current data
+        with np.errstate(invalid="ignore"):
+            est_rate = np.where(
+                obs_mask.sum(axis=0) > 0,
+                obs_conv.sum(axis=0) / obs_mask.sum(axis=0),
+                0.5,  # uninformed prior for unobserved
+            )
+        # Inject uncertainty: add noise proportional to 1/sqrt(n_obs)
+        n_obs = np.maximum(obs_mask.sum(axis=0), 1)
+        uncertainty = 1.0 / np.sqrt(n_obs)
+
+        round_counts = np.zeros(n_prod)
+        for c in range(n_cust):
+            if strategy == "thompson":
+                sampled = est_rate + rng.normal(0, uncertainty)
+                offers = np.argsort(sampled)[::-1][:k]
+            else:  # greedy
+                offers = np.argsort(est_rate)[::-1][:k]
+            round_counts[offers] += 1
+            for p in offers:
+                if not obs_mask[c, p]:
+                    obs_mask[c, p] = True
+                    converted = rng.random() < true_scores[c, p]
+                    obs_conv[c, p] = float(converted)
+
+        round_offer_counts.append(round_counts / round_counts.sum())
+
+    return round_offer_counts
+
+thompson_dist = simulate_fintech_loop("thompson", true_scores, rng2)
+greedy_dist   = simulate_fintech_loop("greedy",   true_scores, rng2)
+
+def gini(v):
+    v = np.sort(v); n = len(v); total = v.sum()
+    if total == 0: return 0.0
+    return float((2 * np.dot(np.arange(1, n+1), v)) / (n * total) - (n+1)/n)
+
+print("Product offer share by round (fraction of all offers):")
+print(f"{'Round':<8}", " ".join(f"{p:<14}" for p in PRODUCT_NAMES))
+print("Thompson:")
+for t, dist in enumerate(thompson_dist):
+    print(f"  {t+1:<6}", " ".join(f"{d:<14.3f}" for d in dist),
+          f"  Gini={gini(dist):.3f}")
+print("Greedy:")
+for t, dist in enumerate(greedy_dist):
+    print(f"  {t+1:<6}", " ".join(f"{d:<14.3f}" for d in dist),
+          f"  Gini={gini(dist):.3f}")
+"""),
+
+        code("""\
+# Plot offer distribution evolution
+fig, axes = plt.subplots(2, N_ROUNDS, figsize=(15, 6), sharey=True)
+colors_prod = sns.color_palette("muted", N_PRODUCTS)
+
+for row_i, (strategy, dists, label) in enumerate([
+    ("thompson", thompson_dist, "Thompson Sampling"),
+    ("greedy",   greedy_dist,   "Greedy"),
+]):
+    for t, dist in enumerate(dists):
+        ax = axes[row_i, t]
+        ax.bar(PRODUCT_NAMES, dist, color=colors_prod, alpha=0.85, edgecolor="white")
+        ax.set_title(f"Round {t+1}\\nGini={gini(dist):.2f}", fontsize=9)
+        ax.set_ylim(0, 1)
+        ax.set_xticklabels(
+            [n.split()[0] for n in PRODUCT_NAMES],
+            rotation=30, ha="right", fontsize=8,
+        )
+        if t == 0:
+            ax.set_ylabel(label, fontsize=10, fontweight="bold")
+        if row_i == 1:
+            ax.set_xlabel("Product")
+
+fig.suptitle(
+    "Product offer distribution over 5 rounds: Thompson vs Greedy",
+    fontsize=12, fontweight="bold"
+)
+plt.tight_layout()
+plt.savefig("outputs/figures/04_fintech_feedback_loop.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""),
+
+        md("""\
+### 5 — Interview talking points
+
+#### For Grab / GXS (fintech lending, ride-hailing super-app)
+
+- **MNAR = offer policy:** GrabLend's historical loan offers were policy-driven.
+  The propensity model learns P(offered | rider features) and corrects for this.
+  Outcome: fairer credit access for under-served driver segments, better CLV models.
+- **Thompson Sampling = responsible exploration:** Regulatory requirement to offer
+  products fairly across demographics. Thompson's posterior-uncertainty exploration
+  keeps the Gini of the offer mix low, producing auditable diversity.
+- **Deconfounded recommender:** The substitute confounder Z captures latent "driver
+  economic status" from the exposure pattern — a natural confound in gig-economy lending.
+
+#### For Google / DeepMind (large-scale ML, research)
+
+- **Bayesian PMF + NUTS:** Demonstrate rigorous posterior inference, R-hat/ESS
+  diagnostics, non-centred parameterisation. Language: "I treat uncertainty as a
+  first-class object, not an afterthought."
+- **PyMC vs NumPyro trade-off:** NUTS for calibration (offline), SVI for online
+  updates. Articulate the mean-field bias explicitly.
+- **Feedback loop as a causal problem:** The greedy feedback loop is a causal
+  phenomenon (interventional distribution vs observational). Thompson Sampling
+  implicitly performs a kind of adaptive randomisation — connect to bandit literature
+  (Thompson 1933, Russo et al. 2018).
+- **DR estimator:** Doubly-robust NDCG uses both a propensity model and a direct
+  model — connect to semiparametric efficiency theory and off-policy evaluation.
+
+#### Universal talking point
+
+> "This project is essentially a controlled experiment on the recommender system
+> itself. The feedback-loop simulation shows what happens if you run your model in
+> production for 10 quarters without intervention — Greedy locks in popularity,
+> Thompson stays diverse. This is exactly the kind of causal thinking that
+> separates ML engineers from ML scientists."
+"""),
+
+    ]
+    return nb
+
+
 # ── Entry point ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1226,4 +1663,5 @@ if __name__ == "__main__":
     save(make_01(), "notebooks/01_bayesian_pmf.ipynb")
     save(make_02(), "notebooks/02_causal_debiasing.ipynb")
     save(make_03(), "notebooks/03_thompson_sampling.ipynb")
+    save(make_04(), "notebooks/04_fintech_framing.ipynb")
     print("Done.")
