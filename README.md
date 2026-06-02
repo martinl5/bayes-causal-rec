@@ -1,16 +1,37 @@
 # Deconfounded & Uncertain: A Bayesian Causal Recommender with Calibrated Exploration
 
-A portfolio project demonstrating the intersection of Bayesian inference, causal debiasing, and uncertainty-driven exploration in recommender systems. The system learns full posteriors over user and item latent factors via PyMC, corrects for missing-not-at-random (MNAR) exposure bias using propensity weighting and the deconfounded recommender framework, and uses Thompson Sampling to mitigate feedback-loop popularity amplification.
+This project fuses Bayesian probabilistic matrix factorization (via PyMC), causal
+propensity-based debiasing (IPS correction and the deconfounded recommender
+framework), and Thompson Sampling to build a recommender system that learns
+calibrated uncertainty over user preferences and uses that uncertainty to actively
+counteract the feedback-loop popularity bias that point-estimate models amplify over
+successive deployment rounds. All models are evaluated on unbiased, randomised test
+splits to produce honest accuracy estimates rather than optimistic in-sample numbers.
 
 ## Motivation
 
-Standard collaborative filtering assumes that unobserved ratings are missing at random — an assumption violated in every real recommender system. Items are shown to users based on prior behaviour, popularity, and business rules, meaning the training data is a biased sample of true preferences. Naive models trained on this data learn to reproduce the historical exposure policy rather than genuine user preferences. Three failure modes compound this:
+Standard collaborative filtering assumes that unobserved ratings are missing
+completely at random — an assumption violated in every real recommender system. Items
+are surfaced to users based on prior behaviour, popularity, and business rules, meaning
+the training data is a biased sample of true preferences. Three compounding failure modes
+follow from this:
 
-- **MNAR bias:** Frequently exposed items accumulate data and appear better-understood; tail items remain uncertain and are chronically under-recommended.
-- **Feedback loops:** Each deployment round exposes popular items more, adding yet more training signal for those items and starving long-tail items — popularity bias amplifies over time.
-- **Cold start and uncertainty:** Point-estimate models (matrix factorization with SGD) produce a single score per user-item pair with no notion of how confident that score is, making it impossible to distinguish "this item is probably bad" from "we have almost no data about this item."
+- **MNAR bias (Missing Not At Random).** Frequently exposed items accumulate training
+  signal and appear better-understood. Tail items remain uncertain and are chronically
+  under-recommended, even when users would actually like them.
+- **Feedback loops.** Each deployment cycle reinforces popularity: popular items get
+  recommended, generate new interactions, and become even more dominant in the next
+  training round. Without a principled exploration mechanism, this spiral is structural
+  and self-sustaining.
+- **Unquantified uncertainty.** Point-estimate matrix factorization produces a single
+  scalar score per user-item pair with no representation of confidence. It is impossible
+  to distinguish "this item is probably irrelevant" from "we have almost no data on this
+  item" — a distinction that matters enormously for exploration and cold-start decisions.
 
-This project addresses all three by combining Bayesian posterior inference (quantified uncertainty), causal propensity models (corrected exposure), and Thompson Sampling (principled explore/exploit using the posterior directly).
+This project addresses all three problems: Bayesian posterior inference gives calibrated
+uncertainty, causal propensity models correct for the biased exposure mechanism, and
+Thompson Sampling uses the posterior directly to balance exploration and exploitation
+without hand-tuning an epsilon or temperature.
 
 ## Repository Structure
 
@@ -25,24 +46,24 @@ bayes-causal-rec/
 │   └── processed/                   # Cleaned/split arrays (gitignored)
 │
 ├── notebooks/
-│   ├── 00_data_exploration.ipynb    # EDA: Coat dataset + synthetic MNAR
-│   ├── 01_bayesian_pmf.ipynb        # Phase 1: Bayesian PMF, diagnostics, metrics
+│   ├── 00_data_exploration.ipynb    # EDA: Coat dataset and synthetic MNAR data
+│   ├── 01_bayesian_pmf.ipynb        # Phase 1: Bayesian PMF, MCMC diagnostics, metrics
 │   ├── 02_causal_debiasing.ipynb    # Phase 2: propensity model, IPS, deconfounded rec
-│   ├── 03_thompson_sampling.ipynb   # Phase 3: Thompson sampling + feedback-loop sim
+│   ├── 03_thompson_sampling.ipynb   # Phase 3: Thompson sampling, feedback-loop simulation
 │   └── 04_fintech_framing.ipynb     # Phase 4: fintech translation and worked example
 │
 ├── scripts/
-│   ├── download_data.py             # Auto-downloads Coat; falls back to synthetic
-│   ├── preprocess.py                # Coat loading + synthetic MNAR generation
+│   ├── download_data.py             # Auto-downloads Coat dataset; falls back to synthetic
+│   ├── preprocess.py                # Coat loading + synthetic MNAR dataset generation
 │   ├── create_notebooks.py          # Programmatic notebook scaffolding utility
 │   ├── models/
 │   │   ├── bayesian_pmf.py          # BayesianPMF (PyMC NUTS), IPSBayesianPMF, NumPyroPMF (SVI)
-│   │   ├── propensity.py            # BayesianPropensityModel (hierarchical logistic)
+│   │   ├── propensity.py            # BayesianPropensityModel (hierarchical logistic regression)
 │   │   ├── deconfounder.py          # DeconfoundedRecommender (Wang et al. 2018)
 │   │   └── thompson_sampler.py      # BayesianThompsonSampler + FeedbackLoopSimulator
 │   └── evaluation/
 │       ├── metrics.py               # NDCG@K, Recall@K, RMSE, doubly-robust NDCG
-│       └── calibration.py           # ECE, calibration curve plotting
+│       └── calibration.py           # Expected Calibration Error, calibration curve plotting
 │
 └── outputs/
     ├── figures/                     # Saved plots (gitignored)
@@ -57,31 +78,34 @@ Python 3.11 is recommended. No GPU is required; all models run on CPU.
 git clone https://github.com/martinl5/bayes-causal-rec.git
 cd bayes-causal-rec
 
-pip install pymc>=5.10 arviz>=0.18 pytensor>=2.20
-pip install numpyro>=0.15 jax>=0.4.26 jaxlib>=0.4.26
-pip install pandas>=2.0 scikit-learn>=1.4
-pip install matplotlib>=3.8 seaborn>=0.13
-pip install jupyter nbformat nbconvert scipy statsmodels
+pip install pymc>=5.10 arviz>=0.18 pytensor>=2.20 numpyro>=0.15 jax>=0.4.26 jaxlib>=0.4.26 pandas>=2.0 scikit-learn>=1.4 matplotlib>=3.8 seaborn>=0.13 scipy statsmodels jupyter nbformat nbconvert requests tqdm
 
 # Verify core imports
 python -c "import pymc; import numpyro; import jax; print('All imports OK')"
 ```
 
-The Coat Shopping dataset (290 users x 300 items, Cornell MNAR benchmark) is downloaded automatically when you run the notebooks or `scripts/download_data.py`. If the download fails, the pipeline falls back to a synthetic MNAR dataset generated by `scripts/preprocess.py` (500 users, 200 items, popularity-based exposure model with known ground-truth propensities).
+The Coat Shopping dataset (290 users x 300 items, Cornell MNAR benchmark) is downloaded
+automatically when you run `scripts/download_data.py` or the notebooks. If the download
+fails, the pipeline falls back to a fully synthetic MNAR dataset generated by
+`scripts/preprocess.py` (500 users, 200 items, popularity-based exposure model with
+known ground-truth propensities). All Phase 2 and Phase 3 results reported here use the
+synthetic dataset because it provides known ground-truth propensities required for
+calibration validation.
 
 ## Running the Notebooks
 
-Run the notebooks in order on a fresh kernel. Each notebook is self-contained and re-generates its figures and metrics.
+Run the notebooks in order on a fresh kernel. Each notebook is self-contained and
+re-generates its figures and metrics from scratch.
 
 | Step | Notebook | Description |
 |------|----------|-------------|
-| 0 | `notebooks/00_data_exploration.ipynb` | Load Coat and synthetic data; plot rating distributions, sparsity, popularity |
-| 1 | `notebooks/01_bayesian_pmf.ipynb` | Fit Bayesian PMF (PyMC NUTS); MCMC diagnostics (R-hat, ESS, energy); NDCG/Recall/RMSE on unbiased test |
-| 2 | `notebooks/02_causal_debiasing.ipynb` | Fit propensity model; calibration curve; compare Naive PMF vs IPS-PMF vs Deconfounded Rec |
-| 3 | `notebooks/03_thompson_sampling.ipynb` | Thompson Sampling demo; 10-round feedback-loop simulation; PyMC vs NumPyro comparison |
-| 4 | `notebooks/04_fintech_framing.ipynb` | Fintech translation; worked example with synthetic bank data |
+| 0 | `notebooks/00_data_exploration.ipynb` | Load Coat and synthetic MNAR data; plot rating distributions, sparsity heatmaps, item popularity |
+| 1 | `notebooks/01_bayesian_pmf.ipynb` | Fit Bayesian PMF with PyMC NUTS; MCMC diagnostics (R-hat, ESS, energy plot); evaluate NDCG, Recall, RMSE on unbiased test |
+| 2 | `notebooks/02_causal_debiasing.ipynb` | Fit Bayesian propensity model; calibration curve and ECE; compare Naive PMF, IPS-PMF, and Deconfounded Recommender |
+| 3 | `notebooks/03_thompson_sampling.ipynb` | Thompson Sampling posterior demo; 10-round feedback-loop simulation (Thompson vs Greedy vs Random); PyMC vs NumPyro comparison |
+| 4 | `notebooks/04_fintech_framing.ipynb` | Translate each project component to fintech/banking; worked example with synthetic bank product data |
 
-To clear outputs before committing (as kept in this repo):
+To clear outputs before committing (as maintained in this repository):
 
 ```bash
 jupyter nbconvert --ClearOutputPreprocessor.enabled=True --inplace notebooks/*.ipynb
@@ -89,76 +113,115 @@ jupyter nbconvert --ClearOutputPreprocessor.enabled=True --inplace notebooks/*.i
 
 ## Results
 
-All metrics are computed on the unbiased test split only (Coat's randomised held-out ratings, or the uniform-random test sample of the synthetic MNAR dataset). Training-set metrics are never reported as accuracy estimates.
+All metrics are computed on the unbiased test split only — Coat's randomised held-out
+ratings or the uniform-random test sample of the synthetic MNAR dataset. Training-set
+metrics are never reported as honest accuracy estimates.
 
-### Phase 1 — Bayesian PMF
+### Phase 1 — Bayesian PMF baseline
 
-Evaluated on the Coat/synthetic unbiased test set, 50 users x 200 items, 2 chains x 500 draws (NUTS).
+Evaluated on the synthetic unbiased test set, 50 users x 200 items, 2 chains x 500
+draws (NUTS, target_accept=0.9).
 
-| Metric | Value |
-|--------|-------|
-| NDCG@10 | 0.692 |
-| Recall@10 | 0.041 |
-| RMSE | 2.968 |
+| Metric    | Value  |
+|-----------|--------|
+| NDCG@10   | 0.6920 |
+| Recall@10 | 0.0409 |
+| RMSE      | 2.9675 |
 
-### Phase 2 — Causal Debiasing Model Comparison
+### Phase 2 — Causal debiasing model comparison
 
-Evaluated on the synthetic MNAR unbiased test set. All models use the same latent dimension and random seed.
+Evaluated on the synthetic MNAR unbiased test set. All models use the same latent
+dimensionality (10 factors) and random seed (42).
 
-| Model | NDCG@10 | Recall@10 | RMSE |
-|-------|---------|-----------|------|
-| Naive PMF | 0.6920 | 0.0409 | 2.9675 |
-| IPS-PMF | 0.6955 | 0.0431 | 3.0505 |
-| Deconfounded Recommender | 0.7200 | 0.0456 | 1.2610 |
+| Model                    | NDCG@10 | Recall@10 | RMSE   |
+|--------------------------|---------|-----------|--------|
+| Naive PMF                | 0.6920  | 0.0409    | 2.9675 |
+| IPS-PMF                  | 0.6955  | 0.0431    | 3.0505 |
+| Deconfounded Recommender | 0.7200  | 0.0456    | 1.2610 |
 
 **Propensity model ECE:** 0.0058 (well-calibrated)
 
-**Note on DR-NDCG:** The doubly-robust NDCG evaluator returns 1.0000 on the synthetic dataset. This is a known artefact of synthetic data where the imputation model is trained and evaluated on data generated from the same process, making the direct model component near-perfect. This result should not be interpreted as a real-world performance claim; it is reported for completeness and as a diagnostic that the DR estimator code path executes correctly.
+Note on the doubly-robust NDCG evaluator: on synthetic data the DR estimator returns
+1.0000 because the imputation model is trained and evaluated on data generated from the
+same process, making the direct-model component near-perfect. This is reported as a
+diagnostic that the DR code path executes correctly, not as a real-world performance claim.
 
-### Phase 3 — Thompson Sampling Feedback-Loop Simulation
+### Phase 3 — Thompson Sampling feedback-loop simulation
 
-T=10 rounds. Each round, the recommender selects items for all users; new observations are added to training data and the model is refit using NumPyro SVI for speed.
+T=10 rounds. At each round the recommender selects items for all users; new observations
+are added to training data and the model is refit using NumPyro SVI (full NUTS per round
+would take approximately 80 minutes).
 
-| Strategy | Final NDCG@10 | Final Coverage | Final Gini |
-|----------|---------------|----------------|------------|
-| Thompson Sampling | 0.775 | 0.905 | 0.217 |
-| Greedy (posterior mean) | 0.728 | 0.525 | 0.688 |
-| Random | 0.786 | 0.925 | 0.103 |
-
-**Key observations:**
-- Greedy recommendations collapse to a narrow popular-item subset (Gini 0.688, coverage 52.5%) — a textbook feedback-loop failure mode.
-- Thompson Sampling achieves near-Random coverage (90.5%) while outperforming Random by a substantial NDCG margin, demonstrating that posterior-uncertainty-driven exploration effectively trades a small amount of immediate exploitation for much better long-run coverage.
-- Random serves as an exploration upper bound on coverage and Gini; Thompson Sampling approaches it without sacrificing the ranking quality that Greedy captures via exploitation.
+| Strategy                | Final NDCG@10 | Final Coverage | Final Gini |
+|-------------------------|---------------|----------------|------------|
+| Thompson Sampling       | 0.775         | 0.905          | 0.217      |
+| Greedy (posterior mean) | 0.728         | 0.525          | 0.688      |
+| Random                  | 0.786         | 0.925          | 0.103      |
 
 ## Key Findings
 
-- **MNAR bias is measurable and correctable.** The Bayesian propensity model achieves ECE of 0.0058, providing reliable IPS weights. IPS correction improves NDCG@10 from 0.6920 to 0.6955 and Recall@10 from 0.0409 to 0.0431. The deconfounded recommender achieves a larger gain (NDCG@10 0.720), likely because it models the confounder structure rather than treating propensities as fixed correction factors.
-- **Posterior uncertainty is the key enabler for feedback-loop mitigation.** Greedy exploitation causes item coverage to collapse to 52.5% by round 10 with a Gini coefficient of 0.688. Thompson Sampling, which samples from the posterior rather than taking the argmax, maintains 90.5% coverage and a Gini of 0.217 — a qualitatively different outcome at the system level.
-- **Calibration is a prerequisite, not an afterthought.** An uncalibrated propensity model produces IPS weights that can increase estimator variance rather than reduce bias. The calibration curve and ECE metric in Phase 2 confirm that the propensity estimates are trustworthy before they are used for correction.
-- **SVI enables simulation at practical speed.** Full NUTS inference (PyMC) takes approximately 8 minutes per fit on the 50-user subset — impractical for 10-round re-fitting. NumPyro SVI reduces this to ~11 seconds (first call, including JIT compilation) and ~3 seconds on subsequent calls, enabling the full feedback-loop simulation without sacrificing the qualitative conclusions.
-- **The deconfounded recommender's identifiability assumptions require honesty.** The substitute-confounder approach (Wang et al. 2018) has been critiqued on identifiability grounds (Ogburn et al. 2022). Evaluation on randomised test sets is essential to avoid over-claiming causal identification; the improvement shown here is in predictive performance on an unbiased test split, not a proof of causal identification.
+- **MNAR bias is measurable and correctable.** The Bayesian propensity model achieves
+  an ECE of 0.0058, providing reliable IPS weights. IPS correction improves NDCG@10
+  from 0.6920 to 0.6955 and Recall@10 from 0.0409 to 0.0431. The deconfounded
+  recommender achieves a larger gain (NDCG@10 0.720), likely because it models the
+  underlying confounder structure rather than treating propensities as fixed scalar
+  correction factors applied post-hoc.
+
+- **Posterior uncertainty is the structural prerequisite for breaking feedback loops.**
+  Greedy exploitation causes item catalogue coverage to collapse to 52.5% by round 10,
+  with a Gini coefficient of 0.688 — a textbook feedback-loop failure mode. Thompson
+  Sampling, which draws from the posterior at recommendation time rather than taking
+  the point-estimate argmax, maintains 90.5% coverage and a Gini of 0.217. This is a
+  qualitatively different system-level outcome, not just a marginal metric improvement.
+
+- **Calibration is a prerequisite for valid IPS correction, not a postscript.**
+  An uncalibrated propensity model produces IPS weights that can increase estimator
+  variance rather than reduce bias. The ECE of 0.0058 and the calibration curve in
+  Phase 2 confirm that the propensity estimates are trustworthy before they are used
+  as correction factors — this verification step should be standard practice in any
+  debiased recommendation pipeline.
+
+- **SVI makes Bayesian simulation practical; the uncertainty trade-off must be
+  acknowledged explicitly.** Full NUTS inference (PyMC) takes approximately 8 minutes
+  per fit on the 50-user subset — impractical for 10 rounds of refit. NumPyro SVI
+  reduces this to roughly 11 seconds on first call (including JAX JIT compilation) and
+  approximately 3 seconds on cached subsequent calls, enabling the full simulation.
+  The cost is that mean-field variational inference underestimates posterior variance,
+  so Thompson Sampling under SVI is more conservative in its exploration than under
+  NUTS. This trade-off is documented explicitly in the Phase 3 notebook comparison table.
 
 ## Framework Comparison: PyMC (NUTS) vs NumPyro (SVI)
 
-| Criterion | PyMC (NUTS) | NumPyro (SVI) |
-|-----------|-------------|----------------|
-| Posterior quality | Exact (asymptotically) | Approximate (mean-field normal) |
-| Uncertainty quantification | Full, calibrated credible intervals | Underestimated (mean-field ignores posterior correlation) |
-| Speed — Coat 50u x 200i | ~8 min/fit | ~11 s first fit (JIT), ~3 s cached |
-| Scalability | Limited (quadratic in data size) | Good (mini-batch subsampling) |
-| JAX/GPU ready | Partial (via PyTensor JAX backend) | Yes (native JAX) |
-| Best use case | Offline analysis, diagnostics, final model evaluation | Simulation loops, online updates, large-scale approximate inference |
+| Criterion                      | PyMC (NUTS)                        | NumPyro (SVI)                          |
+|--------------------------------|------------------------------------|----------------------------------------|
+| Posterior quality              | Exact (asymptotically)             | Approximate (mean-field normal)        |
+| Uncertainty quantification     | Full, calibrated credible intervals | Underestimated (mean-field ignores posterior correlations) |
+| Speed — Coat 50u x 200i        | ~8 min/fit                         | ~11 s first fit (JIT compile), ~3 s cached |
+| Scalability                    | Limited (full data, serial chains) | Good (mini-batch subsampling supported) |
+| JAX/GPU ready                  | Partial (via PyTensor JAX backend) | Yes (native JAX)                       |
+| Best use case                  | Offline analysis, diagnostics, final evaluation | Simulation loops, online updates, large-scale approximate inference |
 
-Both are used in this project: PyMC for all primary model fitting and diagnostic analysis, NumPyro for the feedback-loop simulation where per-round refit speed is critical.
+Both frameworks are used in this project: PyMC for all primary model fitting and
+diagnostic analysis (Phases 1 and 2), NumPyro for the feedback-loop simulation in
+Phase 3 where per-round refit speed is the binding constraint.
 
 ## References
 
-- Wang, Y., Liang, D., Charlin, L., & Blei, D. M. (2018). The Deconfounded Recommender: A Causal Inference Approach to Recommendation. *arXiv:1808.06581*.
-- Schnabel, T., Swaminathan, A., Singh, A., Chandak, N., & Joachims, T. (2016). Recommendations as Treatments: Debiasing Learning and Evaluation. *Proceedings of ICML 2016*.
-- Kawale, J., Bui, H. H., Kveton, B., Tran-Thanh, L., & Chawla, S. (2015). Efficient Thompson Sampling for Online Matrix-Factorization Recommendation. *Advances in NeurIPS 2015*.
-- McElreath, R. (2020). *Statistical Rethinking: A Bayesian Course with Examples in R and Stan* (2nd ed.). Chapman and Hall/CRC.
-- Ogburn, E. L., Shpitser, I., & Tchetgen Tchetgen, E. J. (2022). Counterpoint: Identification is not Enough — On the Assumptions of the Deconfounded Recommender. *arXiv:1910.11379*.
+- Wang, Y., Liang, D., Charlin, L., & Blei, D. M. (2018). The Deconfounded
+  Recommender: A Causal Inference Approach to Recommendation. *arXiv:1808.06581*.
+- Schnabel, T., Swaminathan, A., Singh, A., Chandak, N., & Joachims, T. (2016).
+  Recommendations as Treatments: Debiasing Learning and Evaluation. *Proceedings of
+  the 33rd International Conference on Machine Learning (ICML 2016)*.
+- Kawale, J., Bui, H. H., Kveton, B., Tran-Thanh, L., & Chawla, S. (2015).
+  Efficient Thompson Sampling for Online Matrix-Factorization Recommendation.
+  *Advances in Neural Information Processing Systems (NeurIPS 2015)*.
+- McElreath, R. (2020). *Statistical Rethinking: A Bayesian Course with Examples in
+  R and Stan* (2nd ed.). Chapman and Hall/CRC.
+- Ogburn, E. L., Shpitser, I., & Tchetgen Tchetgen, E. J. (2022). Counterpoint:
+  Identification is not Enough — On the Assumptions of the Deconfounded Recommender.
+  *arXiv:1910.11379*.
 
 ## Author Note
 
-Built as a portfolio project targeting Bayesian + causal RecSys roles at big-tech companies (Google, DeepMind, Grab).
+Built as a portfolio project targeting Bayesian + causal RecSys roles at big-tech
+companies (Google, DeepMind, Grab).
