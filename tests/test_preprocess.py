@@ -48,9 +48,7 @@ def test_test_set_is_mcar_unbiased():
     # the mean true rating over test cells should match the global mean.  The
     # MNAR training set, by contrast, is skewed toward higher ratings because
     # well-liked items are more likely to be observed.
-    d = make_synthetic_mnar(
-        n_users=200, n_items=150, alpha_relevance=1.0, random_seed=11
-    )
+    d = make_synthetic_mnar(n_users=200, n_items=150, alpha_relevance=1.0, random_seed=11)
     true = d["true_ratings"]
     global_mean = float(true.mean())
     test_mean = float(true[d["test_mask"]].mean())
