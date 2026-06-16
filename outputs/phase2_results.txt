@@ -1,8 +1,8 @@
 Phase 2 Results — Synthetic MNAR (50 users x 200 items, 500 draws x 2 chains)
 Model comparison on unbiased test set:
-  Naive PMF    : NDCG@10=0.6867  Recall@10=0.0445  RMSE=1.1818
-  IPS-PMF      : NDCG@10=0.6875  Recall@10=0.0359  RMSE=1.1823
-  Deconfounded : NDCG@10=0.6868  Recall@10=0.0361  RMSE=1.1837
-  DR-NDCG (eval): 0.3801
+  Naive PMF    : NDCG@10=0.7042  Recall@10=0.0412  RMSE=1.1878
+  IPS-PMF      : NDCG@10=0.7093  Recall@10=0.0568  RMSE=1.1516
+  Deconfounded : NDCG@10=0.7125  Recall@10=0.0415  RMSE=1.1450
+  DR-NDCG (eval): 0.3811
 
-Propensity calibration ECE: 0.0055
+Propensity calibration ECE: 0.0053

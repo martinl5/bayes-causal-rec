@@ -158,9 +158,9 @@ the intercepts anchor predictions to the rating scale.
 
 | Metric    | Value  |
 |-----------|--------|
-| NDCG@10   | 0.6867 |
-| Recall@10 | 0.0445 |
-| RMSE      | 1.1818 |
+| NDCG@10   | 0.7042 |
+| Recall@10 | 0.0412 |
+| RMSE      | 1.1878 |
 
 ### Phase 2 — Causal debiasing model comparison
 
@@ -169,21 +169,22 @@ dimensionality (10 factors) and random seed (42).
 
 | Model                    | NDCG@10 | Recall@10 | RMSE   |
 |--------------------------|---------|-----------|--------|
-| Naive PMF                | 0.6867  | 0.0445    | 1.1818 |
-| IPS-PMF                  | 0.6875  | 0.0359    | 1.1823 |
-| Deconfounded Recommender | 0.6868  | 0.0361    | 1.1837 |
+| Naive PMF                | 0.7042  | 0.0412    | 1.1878 |
+| IPS-PMF                  | 0.7093  | 0.0568    | 1.1516 |
+| Deconfounded Recommender | 0.7125  | 0.0415    | 1.1450 |
 
-**Propensity model ECE:** 0.0055 (well-calibrated, 10 equal-width bins)
-**Doubly-robust NDCG@10:** 0.3801
+**Propensity model ECE:** 0.0053 (well-calibrated, 10 equal-width bins)
+**Doubly-robust NDCG@10:** 0.3811
 
-On this synthetic data the three models are nearly tied on ranking quality. That is
-itself the honest finding: when the propensity model is almost perfectly calibrated
-(ECE 0.0055) and the exposure bias is moderate, the debiasing methods have little
-ranking bias left to remove — the headline change from the bias-term fix is that RMSE
-is now on-scale (~1.18 vs the previous ~3.0), not a large NDCG gap between methods.
-IPS slightly degrades Recall here, consistent with the known IPS variance trade-off;
-the mean-normalised weighting keeps it from being worse. A larger separation would
-require stronger exposure bias or the real Coat randomised split.
+On this corrected unbiased (MCAR) test set the debiasing methods come out modestly
+ahead of the naive model: the deconfounded recommender leads on NDCG@10 (0.7125 vs
+0.7042) and RMSE (1.1450 vs 1.1878), and IPS-PMF improves Recall@10 by ~38% (0.0568 vs
+0.0412) and RMSE (1.1516) while edging NDCG up to 0.7093. The gaps are small because the
+propensity model is almost perfectly calibrated (ECE 0.0053) and the synthetic exposure
+bias is moderate, so there is only a limited amount of selection bias to remove — but the
+direction is now consistent with theory: correcting the exposure mechanism helps rather
+than hurts. A larger separation would require stronger exposure bias or the real Coat
+randomised split.
 
 The doubly-robust NDCG (0.38) is now an informative estimate: the estimator ranks by
 the direct model and scores with DR-corrected relevance, so it no longer self-ranks to
@@ -199,9 +200,9 @@ would take roughly 80 minutes).
 
 | Strategy                | Final NDCG@10 | Final Coverage | Final Gini |
 |-------------------------|---------------|----------------|------------|
-| Thompson Sampling       | 0.7944        | 0.880          | 0.226      |
-| Greedy (posterior mean) | 0.7551        | 0.475          | 0.653      |
-| Random                  | 0.8080        | 0.925          | 0.103      |
+| Thompson Sampling       | 0.7985        | 0.865          | 0.222      |
+| Greedy (posterior mean) | 0.7582        | 0.480          | 0.655      |
+| Random                  | 0.8171        | 0.925          | 0.103      |
 
 Read this as a **trade-off, not a single winner**. Per-round NDCG is noisy on 50 users
 with a sparse test set (Thompson touches 0.97 in one round), so the robust, reproducible
@@ -215,16 +216,18 @@ signal is the coverage/Gini separation, not the NDCG ranking.
   behind a healthy-looking NDCG, because ranking is invariant to the global offset that
   RMSE exposes. Always check that predictions land in the rating range.
 
-- **Debiasing only helps when there is bias left to remove.** With a near-perfectly
-  calibrated propensity model (ECE 0.0055) on moderately biased synthetic data, IPS-PMF
-  and the deconfounded recommender land within noise of the naive model on NDCG. Reported
-  honestly: the debiasing machinery is correct and calibrated, but this particular
-  synthetic setup does not exhibit a large ranking bias for it to correct.
+- **Debiasing helps, but only in proportion to the bias present.** On the corrected
+  unbiased (MCAR) test set, IPS-PMF and the deconfounded recommender both beat the naive
+  model — the deconfounder leads NDCG@10 (0.7125 vs 0.7042) and RMSE (1.1450 vs 1.1878),
+  and IPS lifts Recall@10 ~38% (0.0568 vs 0.0412). The gaps are small because the
+  propensity model is near-perfectly calibrated (ECE 0.0053) and the synthetic exposure
+  bias is moderate, so there is only a limited amount of selection bias to remove — but the
+  improvement is in the direction theory predicts.
 
 - **Posterior uncertainty is the structural prerequisite for breaking feedback loops.**
-  Greedy exploitation collapses catalogue coverage to 47.5% by round 10 with a Gini of
-  0.653 — a textbook feedback-loop failure mode. Thompson Sampling, which draws from the
-  posterior rather than taking the argmax, holds 88% coverage at Gini 0.226 — close to
+  Greedy exploitation collapses catalogue coverage to 48.0% by round 10 with a Gini of
+  0.655 — a textbook feedback-loop failure mode. Thompson Sampling, which draws from the
+  posterior rather than taking the argmax, holds 86.5% coverage at Gini 0.222 — close to
   Random's exploration upper bound (92.5%, 0.103) while ranking far better than Greedy.
   It is the Pareto-attractive point, with exploration *targeted* by uncertainty rather
   than uniform.
