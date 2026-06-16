@@ -134,10 +134,12 @@ def doubly_robust_ndcg(
       - **Ranking** is fixed by the direct model (the deployed policy): items
         are ordered by ``direct_model_predictions[u]``.
       - **Gain** uses the DR-corrected relevance
-            dr[u, i] = dm_pred[u, i]
-                       + O_{ui} * (r_{ui} - dm_pred[u, i]) * clip(1 / p_{ui})
-        which is unbiased if either the propensity model OR the rating model is
-        correct (Dudík et al., 2011; Saito & Joachims, 2020).
+            dr[u, i] = m(u, i)
+                       + O_{ui} * (r_{ui} - m(u, i)) * clip(1 / p_{ui})
+        where m(u, i) = dm_pred[u, i] is the direct (rating) model's imputation
+        and O_{ui} is the test-observation indicator.  This estimator is
+        unbiased if either the propensity model OR the rating model is correct
+        (Dudík et al., 2011; Saito & Joachims, 2020).
 
     The earlier version ranked *and* scored by ``dr`` itself, which trivially
     self-ranks to 1.0 — corrected here so the number is informative.

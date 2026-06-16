@@ -22,7 +22,7 @@ def test_pmf_model_has_bias_terms():
         assert v in names
 
 
-def test_ips_weights_are_self_normalised_to_mean_one():
+def test_ips_weights_are_mean_normalised_to_one():
     d = make_synthetic_mnar(n_users=30, n_items=25, n_factors=3, random_seed=1)
     propensities = d["true_propensities"]
     m = IPSBayesianPMF(n_factors=3, random_seed=1)
@@ -30,3 +30,16 @@ def test_ips_weights_are_self_normalised_to_mean_one():
     weights = model.named_vars["ips_weights"].get_value()
     assert abs(float(weights.mean()) - 1.0) < 1e-6
     assert np.all(weights > 0)
+
+
+def test_ips_reduces_to_base_under_uniform_propensity():
+    # Under uniform exposure every raw IPS weight is identical, so after
+    # mean-normalisation they are all exactly 1.0.  The effective observation
+    # std is then 1/(tau*sqrt(1)) = 1/tau, identical to BayesianPMF — i.e. the
+    # IPS model reduces to the base model when there is no selection bias.
+    d = make_synthetic_mnar(n_users=30, n_items=25, n_factors=3, random_seed=2)
+    uniform_prop = np.full_like(d["true_propensities"], 0.3)
+    m = IPSBayesianPMF(n_factors=3, random_seed=2)
+    model = m.build_model(d["train_ratings"], d["train_mask"], uniform_prop, clip_max=5.0)
+    weights = model.named_vars["ips_weights"].get_value()
+    assert np.allclose(weights, 1.0)

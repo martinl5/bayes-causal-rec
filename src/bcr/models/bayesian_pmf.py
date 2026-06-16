@@ -24,7 +24,7 @@ class BayesianPMF:
     Model specification:
         sigma_u ~ HalfNormal(1)
         sigma_v ~ HalfNormal(1)
-        tau     ~ HalfNormal(1)            # observation noise precision
+        tau     ~ HalfNormal(1)            # observation-noise inverse scale (std = 1/tau)
         U_offset[u] ~ Normal(0, 1)         shape: (n_users, n_factors)
         V_offset[i] ~ Normal(0, 1)         shape: (n_items, n_factors)
         U = U_offset * sigma_u             (non-centered reparameterisation)
@@ -270,14 +270,19 @@ class IPSBayesianPMF(BayesianPMF):
     items so the model learns preference estimates closer to the unbiased
     population.
 
-    Modification: the observation noise precision for entry (u, i) is scaled
-    by the IPS weight w_{ui} = clip(1 / P(O_{ui}=1), 1, clip_max).  Items
-    exposed with low probability contribute higher effective precision —
+    Modification: the effective observation precision for entry (u, i) is
+    scaled by the IPS weight w_{ui} = clip(1 / P(O_{ui}=1), 1, clip_max).
+    Items exposed with low probability contribute higher effective precision —
     i.e., the model trusts those rare signals more, correcting for the
     selection mechanism.
 
+    This is the exact per-observation reweighting of the base Normal
+    likelihood (base std = 1/tau): weighting each log-density term by w_{ui}
+    scales the variance by 1/w_{ui}, so the standard deviation becomes
+    (1/tau) / sqrt(w_{ui}).  At w_{ui} ≡ 1 it reduces to BayesianPMF.
+
     Formally:
-        R_{ui} ~ Normal(U[u]·V[i], 1/sqrt(w_{ui} * tau))
+        R_{ui} ~ Normal(U[u]·V[i], 1/(tau * sqrt(w_{ui})))
 
     Args:
         n_factors: Latent factor dimension.
@@ -308,9 +313,11 @@ class IPSBayesianPMF(BayesianPMF):
         global_mean = float(ratings_obs.mean()) if ratings_obs.size else 0.0
 
         # IPS weights for observed entries, clipped to control variance, then
-        # self-normalised to mean 1 (SNIPS-style).  Normalisation keeps the
+        # mean-normalised (weights scaled to mean 1).  Normalisation keeps the
         # effective observation precision on the same scale as the naive model,
         # so IPS reweights *relative* importance without inflating overall noise.
+        # (Note: this is mean-normalisation, distinct from SNIPS, which
+        # sum-normalises a reward estimator rather than a likelihood.)
         prop_obs = np.clip(propensities[user_idx, item_idx], 1e-6, 1.0)
         ips_weights = np.clip(1.0 / prop_obs, 1.0, clip_max)
         ips_weights = (ips_weights / ips_weights.mean()).astype(float)
@@ -347,9 +354,11 @@ class IPSBayesianPMF(BayesianPMF):
                 + pt.sum(U[user_idx] * V[item_idx], axis=1)
             )
 
-            # IPS-scaled sigma: lower propensity → higher weight → tighter noise
+            # IPS-scaled sigma: lower propensity → higher weight → tighter noise.
+            # Base std is 1/tau; weighting the likelihood term by w scales the
+            # variance by 1/w, so std = (1/tau)/sqrt(w) = 1/(tau*sqrt(w)).
             ips_w = pm.Data("ips_weights", ips_weights)
-            effective_sigma = 1.0 / (pt.sqrt(ips_w * tau) + 1e-6)
+            effective_sigma = 1.0 / (tau * pt.sqrt(ips_w) + 1e-6)
 
             ratings_data = pm.Data("ratings_obs", ratings_obs)
             pm.Normal("obs", mu=r_hat, sigma=effective_sigma, observed=ratings_data)
@@ -413,7 +422,11 @@ class NumPyroPMF:
         n_factors: int,
         global_mean: float = 0.0,
     ) -> None:
-        """NumPyro generative model for Bayesian PMF with bias intercepts."""
+        """NumPyro generative model for Bayesian PMF with bias intercepts.
+
+        tau is the observation-noise inverse scale (observation std = 1/tau),
+        matching BayesianPMF.
+        """
         sigma_u = numpyro.sample("sigma_u", dist.HalfNormal(1.0))
         sigma_v = numpyro.sample("sigma_v", dist.HalfNormal(1.0))
         tau = numpyro.sample("tau", dist.HalfNormal(1.0))
