@@ -125,10 +125,14 @@ class BayesianPropensityModel:
         return self.trace
 
     def propensity_scores(self) -> np.ndarray:
-        """Return (n_users, n_items) matrix of posterior-mean P(observed).
+        """Return (n_users, n_items) matrix of plug-in P(observed).
 
         Computed from posterior means of alpha and beta (memory-efficient:
         avoids storing the full n_users×n_items p matrix in the trace).
+        Note this is the plug-in expit(E[alpha] + E[beta]), which approximates
+        the posterior-mean probability E[expit(alpha + beta)]; by Jensen's
+        inequality the two differ slightly, but the plug-in is standard and
+        sufficient for propensity weighting here.
 
         Returns:
             Float32 array of shape (n_users, n_items), values in (0, 1).

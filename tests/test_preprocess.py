@@ -36,10 +36,27 @@ def test_propensities_are_probabilities():
 
 
 def test_train_and_test_masks_disjoint():
-    # Test entries are sampled from unobserved cells, so masks must not overlap.
+    # Test entries are held out before MNAR exposure is sampled, so train and
+    # test masks must never overlap (no leakage).
     d = make_synthetic_mnar(n_users=60, n_items=50, random_seed=3)
     overlap = d["train_mask"] & d["test_mask"]
     assert not overlap.any()
+
+
+def test_test_set_is_mcar_unbiased():
+    # The test set is a uniform (MCAR) sample over ALL (user, item) pairs, so
+    # the mean true rating over test cells should match the global mean.  The
+    # MNAR training set, by contrast, is skewed toward higher ratings because
+    # well-liked items are more likely to be observed.
+    d = make_synthetic_mnar(n_users=200, n_items=150, alpha_relevance=1.0, random_seed=11)
+    true = d["true_ratings"]
+    global_mean = float(true.mean())
+    test_mean = float(true[d["test_mask"]].mean())
+    train_mean = float(true[d["train_mask"]].mean())
+    # MCAR test set: unbiased w.r.t. the full population.
+    assert abs(test_mean - global_mean) < 0.05
+    # MNAR train set: selection bias inflates observed ratings.
+    assert train_mean > test_mean
 
 
 def test_observed_train_entries_are_nonzero():

@@ -3,6 +3,6 @@ Dataset: Synthetic MNAR (50u x 200i), T=10, k=10
 
 Strategy     | Final NDCG@10  | Final Coverage  | Final Gini
 ------------------------------------------------------------
-thompson     | 0.7944         | 0.880           | 0.226
-greedy       | 0.7551         | 0.475           | 0.653
-random       | 0.8080         | 0.925           | 0.103
+thompson     | 0.7985         | 0.865           | 0.222
+greedy       | 0.7582         | 0.480           | 0.655
+random       | 0.8171         | 0.925           | 0.103

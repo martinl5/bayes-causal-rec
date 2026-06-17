@@ -38,9 +38,12 @@ rather than suppressing them; divergences are reported honestly.
   reliability diagram) is checked *before* the propensities are used — an
   uncalibrated propensity model produces IPS weights that add variance instead
   of removing bias.
-- **IPS-PMF.** Inverse-propensity weighting via the observation precision, with
-  the weights clipped and then self-normalised to mean 1 (SNIPS-style) so the
-  reweighting changes *relative* importance without inflating overall noise.
+- **IPS-PMF.** Inverse-propensity weighting that scales each observation's
+  effective precision (base noise std `1/tau` becomes `1/(tau·√w)`, the exact
+  reweighting of the Gaussian likelihood), with the weights clipped and then
+  mean-normalised to 1 so the reweighting changes *relative* importance without
+  inflating overall noise. (Mean-normalisation here is distinct from SNIPS,
+  which sum-normalises a reward estimator rather than a likelihood.)
 - **Doubly-robust NDCG.** Estimates the NDCG of the direct model's ranking using
   DR-corrected relevance labels. The ranking and the gain deliberately come from
   different quantities so the estimator is informative rather than degenerate.
@@ -87,8 +90,9 @@ Gini), with a worked synthetic example.
 ## Evaluation discipline
 
 All accuracy numbers are reported on the **unbiased test split only** — Coat's
-uniform-random held-out ratings, or the uniform-random test sample of the
-synthetic generator. Training-set metrics are never reported as accuracy.
+uniform-random held-out ratings, or the synthetic generator's uniform-random
+(MCAR) test sample, drawn over all user-item pairs independently of the MNAR
+exposure mechanism. Training-set metrics are never reported as accuracy.
 
 ## Reproducing the numbers
 

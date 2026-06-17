@@ -65,6 +65,10 @@ def make_synthetic_mnar(
     This creates Missing-Not-At-Random data: popular, well-liked items are
     more likely to be observed in training, introducing selection bias.
 
+    The test set is a uniform-random (MCAR) sample over all (user, item) pairs,
+    disjoint from training, so it forms a genuinely unbiased evaluation set
+    (matching Coat's randomised-exposure test split).
+
     Args:
         n_users: Number of simulated users.
         n_items: Number of simulated items.
@@ -72,7 +76,8 @@ def make_synthetic_mnar(
         alpha_popularity: Strength of popularity effect on exposure.
         alpha_relevance: Strength of relevance (MNAR) effect on exposure.
         min_obs_prob: Floor on observation probability to avoid zero weights.
-        test_fraction: Fraction of users held out for unbiased test evaluation.
+        test_fraction: Fraction of all (user, item) pairs held out as the
+                       uniform-random (MCAR) unbiased test set.
         random_seed: NumPy random seed.
 
     Returns:
@@ -106,18 +111,23 @@ def make_synthetic_mnar(
     propensities = 1.0 / (1.0 + np.exp(-log_odds))
     propensities = np.clip(propensities, min_obs_prob, 1.0)
 
-    # Sample biased training observations
-    observed = rng.random((n_users, n_items)) < propensities
+    # Unbiased (MCAR) test set: sample test entries uniformly over ALL (u, i)
+    # pairs, independent of the MNAR exposure mechanism.  This matches the
+    # semantics of Coat's uniform-random test split — metrics on it estimate
+    # quality under uniform exposure.  Sampling only from *unobserved* entries
+    # (the previous approach) conditions on O=0 and, under MNAR, skews the test
+    # set toward low-rating / low-popularity pairs, which is NOT unbiased.
+    n_pairs = n_users * n_items
+    n_test = int(n_pairs * test_fraction)
+    test_flat = rng.choice(n_pairs, size=n_test, replace=False)
+    test_mask = np.zeros((n_users, n_items), dtype=bool)
+    test_mask.flat[test_flat] = True
+
+    # Sample biased (MNAR) training observations over the remaining entries.
+    # Train and test are kept disjoint (no leakage).
+    observed = (rng.random((n_users, n_items)) < propensities) & ~test_mask
     train_ratings = np.where(observed, true_ratings, 0.0).astype(np.float32)
 
-    # Unbiased test: uniform random sample over unobserved entries
-    unobserved = ~observed
-    n_unobs = unobserved.sum()
-    n_test = int(n_unobs * test_fraction)
-    unobs_idx = np.argwhere(unobserved)
-    test_sel = rng.choice(len(unobs_idx), size=n_test, replace=False)
-    test_mask = np.zeros((n_users, n_items), dtype=bool)
-    test_mask[unobs_idx[test_sel, 0], unobs_idx[test_sel, 1]] = True
     test_ratings = np.where(test_mask, true_ratings, 0.0).astype(np.float32)
 
     return {
