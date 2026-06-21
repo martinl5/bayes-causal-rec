@@ -14,7 +14,7 @@ Stage 2 — Outcome model conditioned on Z:
     user-side feature, implementing approximate backdoor adjustment:
         P(R_{ui} | do(A_{ui}=a)) ≈ E_Z[ P(R_{ui} | A_{ui}=a, Z) ]
 
-IMPORTANT CAVEAT (Ogburn et al., 2020):
+IMPORTANT CAVEAT (Ogburn et al., 2022):
     The substitute-confounder identification strategy requires strong
     assumptions — specifically that Z contains all common causes of
     (A_{u·}, R_{ui}).  If unmeasured item-level confounders exist,

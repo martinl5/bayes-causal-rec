@@ -120,7 +120,9 @@ re-generates its figures and metrics from scratch.
 | 3 | `notebooks/03_thompson_sampling.ipynb` | Thompson Sampling posterior demo; 10-round feedback-loop simulation (Thompson vs Greedy vs Random); PyMC vs NumPyro comparison |
 | 4 | `notebooks/04_fintech_framing.ipynb` | Translate each project component to fintech/banking; worked example with synthetic bank product data |
 
-To clear outputs before committing (as maintained in this repository):
+The committed notebooks include their executed cell outputs (figures and metrics)
+so they can be read on GitHub without re-running. To clear those outputs (e.g. for a
+lighter diff before committing source-only changes):
 
 ```bash
 jupyter nbconvert --ClearOutputPreprocessor.enabled=True --inplace notebooks/*.ipynb
